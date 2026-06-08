@@ -1,5 +1,7 @@
 # Qualcomm QCS8550 + DeepX M1 Project
 
+<img width="1536" height="2048" alt="WhatsApp Image 2026-06-08 at 12 25 02" src="https://github.com/user-attachments/assets/1f4d4cc9-9de0-4ed7-84e8-9e17cf4b4dc9" />
+
 ## 🔄 Board Backup & Restore (IMPORTANT!)
 
 **Current Board Status**: Running IMDT DeepX Demo (dual-camera pose estimation + YOLOv8 detection)
