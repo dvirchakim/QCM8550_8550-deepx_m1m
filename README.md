@@ -19,8 +19,9 @@ Press **HOME** at any time to stop the current demo and return to the picker.
 
 | Demo | Service | Description |
 |---|---|---|
-| **IMDT DeepX** | `imdt-deepx-demo.service` | Dual-camera YOLOv5-Pose + YOLOX-S detection on DeepX DX-M1 NPU |
-| **Edge-Art GenAI** | `edge-art.service` | Pose skeleton (DeepX) + ControlNet/SD 1.5 generative art (Qualcomm HTP) |
+| **IMDT DeepX** | `imdt-deepx-demo.service` | Dual-camera: Camera 0 → YOLOv5-Pose on DeepX DX-M1, Camera 1 → YOLOv8 Detection on HTP |
+| **YOLO26 Parallel** | `yolo26-parallel.service` | Dual-camera: Camera 0 → YOLOv8 Detection on HTP, Camera 1 → YOLO26L-SEG instance segmentation on DeepX |
+| **Edge-Art GenAI** | `edge-art.service` | Single-camera: pose skeleton on DeepX + ControlNet/SD 1.5 generative art on HTP |
 
 ---
 
@@ -48,7 +49,32 @@ Press **HOME** at any time to stop the current demo and return to the picker.
 └──────────────────────────────────────────────────────┘
 ```
 
-### Demo 2 — Edge-Art GenAI (single camera → two NPUs)
+### Demo 2 — YOLO26 Parallel (dual-camera, heterogeneous)
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    QCS8550 SBC                       │
+│                                                      │
+│  ┌─────────┐    ┌──────────────────────────────────┐ │
+│  │Camera 0 │───▶│ Qualcomm HTP (DSP)               │ │
+│  │1920×1080│    │  YOLOv8 Detection overlay        │ │
+│  └─────────┘    │  left pane                       │ │
+│                 └──────────────────────────────────┘ │
+│  ┌─────────┐    ┌──────────────────────────────────┐ │
+│  │Camera 1 │───▶│ DeepX DX-M1 NPU                  │ │
+│  │1920×1080│    │  YOLO26L-SEG segmentation        │ │
+│  └─────────┘    │  dxpreprocess/dxinfer/dxpostproc │ │
+│                 │  right pane                      │ │
+│                 └──────────────────────────────────┘ │
+│                         │                            │
+│                 ┌────────▼─────────┐                 │
+│                 │  Weston/Wayland  │                 │
+│                 │  2-pane display  │                 │
+│                 └──────────────────┘                 │
+└──────────────────────────────────────────────────────┘
+```
+
+### Demo 3 — Edge-Art GenAI (single camera → two NPUs)
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -112,8 +138,9 @@ Press **HOME** at any time to stop the current demo and return to the picker.
 | Service | Enabled | Restart | Purpose |
 |---|---|---|---|
 | `demo-picker.service` | ✅ | `always` | Boot menu — owns the display |
-| `edge-art.service` | ✅ | `on-failure` | GenAI demo — launched by picker |
-| `imdt-deepx-demo.service` | ✅ | — | Original DeepX demo |
+| `imdt-deepx-demo.service` | ✅ | — | Dual-cam DeepX pose + HTP detection |
+| `yolo26-parallel.service` | ✅ | `on-failure` | Dual-cam YOLO26 seg (DeepX) + YOLOv8 (HTP) |
+| `edge-art.service` | ✅ | `on-failure` | GenAI: DeepX pose + HTP ControlNet/SD |
 | `qmmf-server.service` | ✅ | — | Camera server (required) |
 
 ---

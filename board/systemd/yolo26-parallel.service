@@ -1,0 +1,28 @@
+[Unit]
+Description=YOLO26 Parallel Demo (dual-camera: YOLO26L-SEG on DeepX + YOLOv8 on HTP)
+Documentation=https://github.com/dvirchakim/QCM8550_8550-deepx_m1m
+Wants=init_qti_graphics.service init_display.service qmmf-server.service
+After=init_qti_graphics.service init_display.service qmmf-server.service
+
+[Service]
+Type=simple
+User=root
+Environment=ADSP_LIBRARY_PATH=/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp
+Environment=XDG_RUNTIME_DIR=/run/user/root
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=QT_QPA_PLATFORM=wayland-egl
+Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
+
+ExecStartPre=/bin/sh -c 'cd /lib/modules/$(uname -r)/extra && insmod dxrt_driver.ko 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'pkill -9 gst-launch-1.0 2>/dev/null || true; sleep 1'
+ExecStart=/bin/sh /data/local/tmp/yolo26_parallel.sh
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=15
+KillMode=control-group
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yolo26-parallel
