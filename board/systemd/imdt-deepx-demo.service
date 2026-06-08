@@ -1,0 +1,23 @@
+# Copyright (c) 2026 IMD Technologies
+# All Rights Reserved.
+#
+
+[Unit]
+Description=IMDT Qualcomm + DeepX demo
+SourcePath=/usr/share/dx-stream/imdt-deepx-demo.sh
+
+[Service]
+User=root
+Type=Simple
+Environment="ADSP_LIBRARY_PATH=/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp"
+Environment=XDG_RUNTIME_DIR=/run/user/root/
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=QT_QPA_PLATFORM=wayland-egl
+Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
+Requires=init_qti_graphics.service qmmf-server.service
+After=init_qti_graphics.service qmmf-server.service
+ExecStart=/bin/sh -c '/bin/mount -o rw,remount "/" ; /usr/share/dx-stream/imdt-deepx-demo.sh'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

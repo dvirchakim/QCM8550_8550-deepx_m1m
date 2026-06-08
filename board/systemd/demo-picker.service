@@ -1,0 +1,33 @@
+[Unit]
+Description=Demo Picker (touchscreen menu + HOME button)
+Documentation=https://github.com/dvirchakim/QCM8550_8550-deepx_m1m
+Wants=init_qti_graphics.service init_display.service
+After=init_qti_graphics.service init_display.service
+
+[Service]
+Type=simple
+User=root
+Environment=ADSP_LIBRARY_PATH=/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp
+Environment=XDG_RUNTIME_DIR=/run/user/root
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=QT_QPA_PLATFORM=wayland-egl
+Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
+
+ExecStartPre=/bin/sh -c 'chmod +x /data/local/tmp/demo_picker'
+ExecStartPre=/bin/sh -c 'systemctl stop edge-art.service imdt-deepx-demo.service 2>/dev/null || true'
+ExecStart=/data/local/tmp/demo_picker
+
+Restart=always
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=10
+WatchdogSec=120
+NotifyAccess=none
+KillMode=control-group
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=demo-picker
+
+[Install]
+WantedBy=multi-user.target

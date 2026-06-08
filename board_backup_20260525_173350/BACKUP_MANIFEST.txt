@@ -1,0 +1,59 @@
+﻿========================================
+QUALCOMM QCS8550 BOARD BACKUP MANIFEST
+========================================
+Backup Date: 2026-05-25 17:34:08
+Device ID: a9ef4ffe
+Kernel Version: 5.15.148-qki-consolidate
+
+BACKED UP COMPONENTS:
+---------------------
+1. DeepX Demo Application
+   - Location: /usr/share/dx-stream/
+   - Startup Script: imdt-deepx-demo.sh
+   - Configs: configs/ directory
+   - Libraries: lib/ directory
+
+2. AI Models
+   - Location: /opt/
+   - YOLOv8 Detection Model
+   - YOLO Pose Estimation Models
+   - HRNet Pose Model
+   - Label files
+
+3. Systemd Services
+   - imdt-deepx-demo.service (Main demo service)
+   - qmmf-server.service (Qualcomm Multimedia Framework)
+   - init_qti_graphics.service (Graphics initialization)
+
+4. Kernel Modules
+   - dxrt_driver.ko (DeepX Runtime Driver)
+   - Location: /lib/modules/5.15.148-qki-consolidate/extra/
+
+5. GStreamer Plugins
+   - Location: /usr/lib/gstreamer-1.0/
+   - DeepX plugins (dxpreprocess, dxinfer, dxpostprocess, dxosd)
+   - Qualcomm plugins (qtiqmmfsrc, qtivtransform, qtivcomposer, etc.)
+
+6. Device Nodes
+   - /dev/fastrpc* (FastRPC devices for DSP communication)
+   - /dev/adsprpc* (ADSP RPC devices)
+   - /dev/video* (Video devices)
+
+7. System Information
+   - Running processes
+   - Loaded modules
+   - Service status
+   - Mount points
+
+RESTORE INSTRUCTIONS:
+--------------------
+Use the restore_board.ps1 script to restore this backup to a clean board.
+
+NOTES:
+------
+- This backup includes the complete DeepX demo that runs on boot
+- The demo performs dual-camera pose estimation + YOLOv8 object detection
+- Requires Qualcomm QCS8550 board with proper BSP installed
+- Weston compositor must be running for display output
+
+========================================

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Large model binaries (kept on device, see board/models_info/QNN_MODELS.md)
+*.bin
+*.tflite
+*.dxnn
+*.dlc
+models/
+
+# Logs
+*.log
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Large archives / BSP zips
+*.zip
+
+# Compiled shared libraries (board backup)
+*.so
+
+# Temp
+fix_lf.py
