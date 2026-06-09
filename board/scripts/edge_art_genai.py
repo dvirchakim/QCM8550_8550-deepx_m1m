@@ -49,7 +49,8 @@ NMS_THR               = 0.45
 # SD config
 SD_W, SD_H   = 512, 512
 LAT_H, LAT_W = 64, 64
-SD_STEPS     = 4      # denoising steps (4 = ~16s, 8 = ~32s)
+SD_STEPS     = 6      # denoising steps (6 = ~36s with CFG)
+CFG_SCALE    = 7.5    # classifier-free guidance strength (0=off, 7.5=standard)
 ADSP_PATH    = "/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp"
 
 # ---------------------------------------------------------------------------
@@ -335,12 +336,15 @@ class ControlNetPipeline:
 
     # -----------------------------------------------------------------------
     def _denoise(self, canny_map: np.ndarray, style_key: str) -> np.ndarray:
-        # 1. Text embedding (cached)
-        te_u16_flat = self._encode_text(style_key)
-        # Re-quantize from te-output space → CN/UNet input space
-        te_f32 = dequant(te_u16_flat, "te_text_emb_out").reshape(1, 77, 768)
-        te_cn   = quant(te_f32, "cn_text_emb").flatten()
-        te_unet = quant(te_f32, "unet_text_emb").flatten()
+        # 1. Text embeddings — cond (style) + uncond (negative) for CFG
+        te_cond_u16  = self._encode_text(style_key)
+        te_uncond_u16 = self._encode_text("neg")
+        te_cond_f32   = dequant(te_cond_u16,  "te_text_emb_out").reshape(1, 77, 768)
+        te_uncond_f32 = dequant(te_uncond_u16, "te_text_emb_out").reshape(1, 77, 768)
+        # Re-quantize into CN / UNet input space
+        te_cn_cond    = quant(te_cond_f32,   "cn_text_emb").flatten()
+        te_unet_cond  = quant(te_cond_f32,   "unet_text_emb").flatten()
+        te_unet_uncond = quant(te_uncond_f32, "unet_text_emb").flatten()
 
         # 2. Canny condition → quantize for ControlNet
         canny_resized = cv2.resize(canny_map, (SD_W, SD_H))
@@ -352,28 +356,33 @@ class ControlNetPipeline:
         timesteps = get_ddim_timesteps(SD_STEPS)
         latent_f32 = np.random.randn(1, LAT_H, LAT_W, 4).astype(np.float32)
 
-        # 4. DDIM denoising loop
+        # 4. DDIM denoising loop with CFG
+        #    Strategy: run CN once per step (conditioned), share residuals with both
+        #    conditioned and unconditioned UNet passes → 1 CN + 2 UNet per step.
         for step_i, t in enumerate(timesteps):
             t_prev = timesteps[step_i + 1] if step_i + 1 < len(timesteps) else -1
 
-            # Quantize latent and timestep for each model
             lat_cn   = quant(latent_f32, "cn_latent").flatten()
             lat_unet = quant(latent_f32, "unet_latent").flatten()
+            ts_cn    = quant(np.array([[np.float32(t)]], np.float32), "cn_timestep").flatten()
+            ts_unet  = quant(np.array([[np.float32(t)]], np.float32), "unet_timestep").flatten()
 
-            ts_val_cn   = np.float32(t)
-            ts_val_unet = np.float32(t)
-            ts_cn   = quant(np.array([[ts_val_cn]],   np.float32), "cn_timestep").flatten()
-            ts_unet = quant(np.array([[ts_val_unet]], np.float32), "unet_timestep").flatten()
+            # ControlNet (cond text + canny) — residuals shared with both UNet passes
+            cn_out = self._run_controlnet(lat_cn, ts_cn, te_cn_cond, canny_u16)
 
-            # ControlNet
-            cn_out = self._run_controlnet(lat_cn, ts_cn, te_cn, canny_u16)
+            # UNet — conditioned
+            noise_u16_cond  = self._run_unet(lat_unet, ts_unet, te_unet_cond,  cn_out)
+            noise_cond      = dequant(noise_u16_cond,  "unet_out").reshape(1, LAT_H, LAT_W, 4)
 
-            # UNet
-            noise_u16 = self._run_unet(lat_unet, ts_unet, te_unet, cn_out)
-            noise_f32  = dequant(noise_u16, "unet_out").reshape(1, LAT_H, LAT_W, 4)
+            # UNet — unconditioned (same CN residuals, empty text)
+            noise_u16_uncond = self._run_unet(lat_unet, ts_unet, te_unet_uncond, cn_out)
+            noise_uncond     = dequant(noise_u16_uncond, "unet_out").reshape(1, LAT_H, LAT_W, 4)
+
+            # Classifier-Free Guidance
+            noise_guided = noise_uncond + CFG_SCALE * (noise_cond - noise_uncond)
 
             # DDIM step
-            latent_f32 = ddim_step(latent_f32, noise_f32, t, t_prev)
+            latent_f32 = ddim_step(latent_f32, noise_guided, t, t_prev)
 
         # 5. VAE decode
         lat_vae = quant(latent_f32, "vae_latent").flatten()
@@ -401,7 +410,7 @@ class ControlNetPipeline:
             self._fps_t.append(time.time())
             with self._lock:
                 self._latest = cv2.resize(img, (PANE_W, PANE_H))
-            print(f"[genai] {elapsed:.1f}s  qnn={self._ready}  style={style_key}")
+            print(f"[genai] {elapsed:.1f}s  cfg={CFG_SCALE}  steps={SD_STEPS}  qnn={self._ready}  style={style_key}")
 
     # -----------------------------------------------------------------------
     @staticmethod
@@ -541,9 +550,11 @@ def pose_to_canny(persons, frame=None, w=SD_W, h=SD_H):
     for p in persons:
         kps=p["kps"]; pts=[(int(x*sx),int(y*sy)) if c>0.3 else None for x,y,c in kps]
         for a,b in SKELETON:
-            if pts[a] and pts[b]: cv2.line(canvas,pts[a],pts[b],(255,255,255),4,cv2.LINE_AA)
+            if pts[a] and pts[b]: cv2.line(canvas,pts[a],pts[b],(255,255,255),7,cv2.LINE_AA)
         for pt in pts:
-            if pt: cv2.circle(canvas,pt,6,(255,255,255),-1,cv2.LINE_AA)
+            if pt: cv2.circle(canvas,pt,9,(255,255,255),-1,cv2.LINE_AA)
+    # Dilate skeleton for thicker, more prominent ControlNet guidance
+    canvas=cv2.dilate(canvas,np.ones((3,3),np.uint8),iterations=1)
     gray=cv2.cvtColor(canvas,cv2.COLOR_BGR2GRAY)
     skel_edges=cv2.Canny(gray,50,150)
     # Blend with camera-frame canny for structural detail
