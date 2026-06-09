@@ -1,0 +1,25 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture arm64 \
+    && sed -i 's/^deb \(http:\/\/archive\|http:\/\/security\)/deb [arch=amd64] \1/g' /etc/apt/sources.list \
+    && echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse" >> /etc/apt/sources.list \
+    && echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list \
+    && echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse" >> /etc/apt/sources.list \
+    && apt-get update && apt-get install -y \
+    g++-aarch64-linux-gnu \
+    pkg-config \
+    libgstreamer1.0-dev:arm64 \
+    libgstreamer-plugins-base1.0-dev:arm64 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY demo_picker.cpp .
+
+RUN PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+    aarch64-linux-gnu-g++ -O2 -std=c++17 \
+    -o demo_picker demo_picker.cpp \
+    $(PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+      pkg-config --cflags --libs \
+      gstreamer-1.0 gstreamer-app-1.0) \
+    -lpthread
