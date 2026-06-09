@@ -16,7 +16,7 @@ Deploy:
 """
 from __future__ import annotations
 
-import os, queue, subprocess, sys, threading, time, shlex
+import os, queue, struct, subprocess, sys, threading, time, shlex, ctypes
 from collections import deque
 from pathlib import Path
 
@@ -68,7 +68,8 @@ TOKENIZED = {
     "neg":     [49406] + [49407]*76,
 }
 STYLE_KEYS    = ["neon", "vangogh", "comic", "noir"]
-STYLE_CYCLE_S = 20.0
+STYLE_CYCLE_S = 30.0   # auto-cycle period (overridden by touch)
+CROSSFADE_FRAMES = 12  # art blend-in duration (frames)
 
 STYLE_LABELS = {
     "neon":    "NEON CYBERPUNK",
@@ -533,18 +534,40 @@ def _draw_skel(img, p, color, th, jr):
         if pt: cv2.circle(img,pt,jr,color,-1,cv2.LINE_AA)
 
 
-def pose_to_canny(persons, w=SD_W, h=SD_H):
+def pose_to_canny(persons, frame=None, w=SD_W, h=SD_H):
+    """Hybrid canny: skeleton lines + camera-frame edges blended for richer ControlNet input."""
     canvas=np.zeros((h,w,3),np.uint8)
     sx=w/CAM_W; sy=h/CAM_H
     for p in persons:
         kps=p["kps"]; pts=[(int(x*sx),int(y*sy)) if c>0.3 else None for x,y,c in kps]
         for a,b in SKELETON:
-            if pts[a] and pts[b]: cv2.line(canvas,pts[a],pts[b],(255,255,255),3,cv2.LINE_AA)
+            if pts[a] and pts[b]: cv2.line(canvas,pts[a],pts[b],(255,255,255),4,cv2.LINE_AA)
         for pt in pts:
-            if pt: cv2.circle(canvas,pt,5,(255,255,255),-1,cv2.LINE_AA)
+            if pt: cv2.circle(canvas,pt,6,(255,255,255),-1,cv2.LINE_AA)
     gray=cv2.cvtColor(canvas,cv2.COLOR_BGR2GRAY)
-    edges=cv2.Canny(gray,50,150)
-    return cv2.cvtColor(edges,cv2.COLOR_GRAY2BGR)
+    skel_edges=cv2.Canny(gray,50,150)
+    # Blend with camera-frame canny for structural detail
+    if frame is not None and len(persons):
+        frame_small=cv2.resize(frame,(w,h))
+        frame_gray=cv2.cvtColor(frame_small,cv2.COLOR_BGR2GRAY)
+        frame_blur=cv2.GaussianBlur(frame_gray,(5,5),0)
+        frame_edges=cv2.Canny(frame_blur,40,100)
+        # Weight: skeleton 70% + frame 30%
+        blended=cv2.addWeighted(skel_edges,0.7,frame_edges,0.3,0)
+    else:
+        blended=skel_edges
+    return cv2.cvtColor(blended,cv2.COLOR_GRAY2BGR)
+
+
+def _pose_hash(persons):
+    """Cheap fingerprint of current pose — only re-generate art when it changes."""
+    if not persons:
+        return 0
+    pts=[]
+    for p in persons[:2]:  # track up to 2 people
+        for x,y,c in p["kps"]:
+            if c>0.3: pts+=[int(x/20)*20, int(y/20)*20]  # 20px grid
+    return hash(tuple(pts))
 
 
 # ---------------------------------------------------------------------------
@@ -556,44 +579,98 @@ def hud_header(frame, style, n_persons, deepx_ms, cam_fps, genai_fps, genai_read
     cv2.rectangle(frame,(0,36),(w,38),(0,180,255),-1)
     cv2.putText(frame,"IMDT QCS8550 + DEEPX DX-M1  |  HETEROGENEOUS AI EDGE DEMO",
                 (10,25),cv2.FONT_HERSHEY_SIMPLEX,0.52,(0,180,255),1,cv2.LINE_AA)
+    # Person count badge
+    if n_persons>0:
+        badge=f"{n_persons} person{'s' if n_persons>1 else ''}"
+        cv2.putText(frame,badge,(w-220,25),cv2.FONT_HERSHEY_SIMPLEX,0.48,(0,255,150),1,cv2.LINE_AA)
 
 
 def hud_left(pane, n_persons, deepx_ms, cam_fps, style):
     cv2.rectangle(pane,(0,38),(pane.shape[1],72),(10,12,22),-1)
     cv2.rectangle(pane,(0,70),(pane.shape[1],72),(0,229,255),-1)
     cv2.putText(pane,
-        f"DEEPX DX-M1 | YOLOv5-Pose | {n_persons}p | {deepx_ms:.0f}ms | {cam_fps:.0f}fps",
+        f"DEEPX DX-M1  YOLOv5-Pose  {deepx_ms:.0f}ms  {cam_fps:.0f}fps",
         (8,60),cv2.FONT_HERSHEY_SIMPLEX,0.46,(0,229,255),1,cv2.LINE_AA)
 
 
-def hud_right(pane, genai_fps, genai_ready, style):
+def hud_right(pane, genai_fps, genai_ready, style, gen_count):
     col=(0,255,100) if genai_ready else (0,180,255)
     label=f"QCS8550 HTP  ControlNet+SD1.5  {SD_STEPS}steps" if genai_ready else "LOADING QNN MODELS..."
     cv2.rectangle(pane,(0,38),(pane.shape[1],72),(10,22,12),-1)
     cv2.rectangle(pane,(0,70),(pane.shape[1],72),col,-1)
-    cv2.putText(pane,f"{label} | {genai_fps:.2f}fps | {STYLE_LABELS.get(style,style.upper())}",
+    gen_str=f"#{gen_count}" if gen_count else ""
+    cv2.putText(pane,f"{label}  {gen_str}",
                 (8,60),cv2.FONT_HERSHEY_SIMPLEX,0.42,col,1,cv2.LINE_AA)
 
 
+# Style button hit-test regions (in right-pane coordinates)
+STYLE_BTN_BH=44; STYLE_BTN_BW=160
+def _btn_rect(i):
+    x0=PANE_W-STYLE_BTN_BW-8; y=80+i*(STYLE_BTN_BH+6)
+    return x0, y, x0+STYLE_BTN_BW, y+STYLE_BTN_BH
+
 def draw_style_buttons(pane, current_style):
-    bh=44; bw=160; x0=pane.shape[1]-bw-8
     for i,key in enumerate(STYLE_KEYS):
-        y=80+i*(bh+6); active=(key==current_style)
+        x0,y0,x1,y1=_btn_rect(i); active=(key==current_style)
         bg=(0,180,255) if active else (30,30,50)
         border=(0,255,180) if active else (80,80,120)
-        cv2.rectangle(pane,(x0,y),(x0+bw,y+bh),bg,-1)
-        cv2.rectangle(pane,(x0,y),(x0+bw,y+bh),border,2)
-        cv2.putText(pane,STYLE_LABELS[key],(x0+8,y+27),
+        cv2.rectangle(pane,(x0,y0),(x1,y1),bg,-1)
+        cv2.rectangle(pane,(x0,y0),(x1,y1),border,2)
+        cv2.putText(pane,STYLE_LABELS[key],(x0+8,y0+27),
                     cv2.FONT_HERSHEY_SIMPLEX,0.42,
                     (255,255,255) if active else (160,160,200),1,cv2.LINE_AA)
 
 
-def draw_power_widget(pane, deepx_ms):
-    est=min(4.2+deepx_ms/100.0, 9.8)
-    cv2.rectangle(pane,(8,80),(180,140),(15,20,35),-1)
-    cv2.rectangle(pane,(8,80),(180,140),(0,140,200),1)
-    cv2.putText(pane,"SYSTEM POWER",(14,98),cv2.FONT_HERSHEY_SIMPLEX,0.38,(0,140,200),1,cv2.LINE_AA)
-    cv2.putText(pane,f"{est:.1f} W",(20,128),cv2.FONT_HERSHEY_SIMPLEX,0.85,(0,229,255),2,cv2.LINE_AA)
+# ---------------------------------------------------------------------------
+# Touch input (style switching)
+# ---------------------------------------------------------------------------
+_libc=ctypes.CDLL("libc.so.6",use_errno=True)
+EV_KEY=0x01; EV_ABS=0x03; BTN_TOUCH=0x14A
+ABS_X=0x00; ABS_Y=0x01; ABS_MT_X=0x35; ABS_MT_Y=0x36
+EVIOCGBIT_EV=0x80084500
+TOUCH_MAX_X=1023; TOUCH_MAX_Y=599
+
+_touch_style=None  # set by touch thread when user taps a style button
+_touch_lock=threading.Lock()
+
+def _find_touch_dev():
+    for i in range(4):
+        p=f"/dev/input/event{i}"
+        try:
+            fd=os.open(p,os.O_RDONLY|os.O_NONBLOCK)
+            buf=(ctypes.c_uint8*8)()
+            if _libc.ioctl(fd,EVIOCGBIT_EV,buf)>=0:
+                bits=int.from_bytes(bytes(buf),"little")
+                if bits&(1<<EV_ABS): return fd
+            os.close(fd)
+        except Exception: pass
+    return -1
+
+def _touch_thread_fn():
+    global _touch_style
+    fd=_find_touch_dev()
+    if fd<0: return
+    fmt="llHHi"; sz=struct.calcsize(fmt)
+    tx=ty=0
+    while True:
+        try: data=os.read(fd,sz)
+        except BlockingIOError: time.sleep(0.005); continue
+        if len(data)<sz: continue
+        _,_,evtype,code,value=struct.unpack(fmt,data)
+        if evtype==EV_ABS:
+            if code in(ABS_X,ABS_MT_X): tx=value
+            if code in(ABS_Y,ABS_MT_Y): ty=value
+        if evtype==EV_KEY and code==BTN_TOUCH and value==1:
+            # Map raw touch → screen (1920×1080 full, display is 1280×720 centred)
+            sx=tx*1280//TOUCH_MAX_X; sy=ty*720//TOUCH_MAX_Y
+            # Right pane starts at x=640
+            if sx>=640:
+                rpx=sx-640  # position within right pane
+                for i,key in enumerate(STYLE_KEYS):
+                    bx0,by0,bx1,by1=_btn_rect(i)
+                    if bx0<=rpx<=bx1 and by0<=sy<=by1:
+                        with _touch_lock: _touch_style=key
+                        break
 
 
 def make_placeholder(style):
@@ -603,6 +680,14 @@ def make_placeholder(style):
     cv2.putText(ph,"QNN HTP INITIALIZING",(55,PANE_H//2+20),
                 cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,80,140),1,cv2.LINE_AA)
     return ph
+
+
+def crossfade(prev, next_, alpha):
+    """Alpha-blend two same-size BGR frames. alpha=0→prev, alpha=1→next_."""
+    if prev is None: return next_
+    if next_ is None: return prev
+    a=np.clip(alpha,0.0,1.0)
+    return cv2.addWeighted(prev,1.0-a,next_,a,0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +732,7 @@ def read_exact(fp, n):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    global _touch_style
     style_idx=0; style=STYLE_KEYS[0]; style_t0=time.time()
 
     print("[edge-art] Starting Edge-Art GenAI Demo")
@@ -660,6 +746,9 @@ def main():
 
     print("[edge-art] Starting ControlNet pipeline ...")
     pipeline=ControlNetPipeline()
+
+    # Touch input thread (for interactive style switching)
+    threading.Thread(target=_touch_thread_fn,daemon=True).start()
 
     subprocess.run(["systemctl","restart","qmmf-server.service"],
                    check=False,stderr=subprocess.DEVNULL)
@@ -675,10 +764,14 @@ def main():
         cam.terminate(); return 1
 
     cam_bytes=CAM_W*CAM_H*3
-    genai_rate=5    # submit new genai request every N pose frames
     n_frames=0; persons=[]; last_deepx_ms=0.0
-    latest_art=None; placeholder=make_placeholder(style)
+    displayed_art=None   # currently shown (possibly mid-crossfade)
+    incoming_art=None    # newly arrived art to fade in
+    crossfade_t=0        # frame counter for crossfade
+    prev_pose_hash=None  # smart trigger: only re-gen when pose changes
+    placeholder=make_placeholder(style)
     in_times=deque(maxlen=30); npu_times=deque(maxlen=30)
+    gen_count=0
 
     print("[edge-art] Running — Ctrl-C to stop.")
     try:
@@ -698,25 +791,49 @@ def main():
             npu_times.append(last_deepx_ms/1000.0)
             persons=decode_pose(outs[0].reshape(-1,57),r,dx,dy)
 
-            # Submit GenAI
-            if n_frames%genai_rate==0:
-                canny=pose_to_canny(persons)
+            # Touch: interactive style switch
+            with _touch_lock:
+                if _touch_style is not None:
+                    style=_touch_style; _touch_style=None
+                    style_idx=STYLE_KEYS.index(style); style_t0=time.time()
+                    placeholder=make_placeholder(style)
+                    print(f"[edge-art] touch style → {style}")
+
+            # Smart GenAI trigger: only re-submit when pose changed meaningfully
+            cur_hash=_pose_hash(persons)
+            if cur_hash!=prev_pose_hash and persons:
+                canny=pose_to_canny(persons, frame)
                 pipeline.submit(canny, style)
+                prev_pose_hash=cur_hash
+
+            # Art crossfade: detect new art arrival, blend it in over CROSSFADE_FRAMES
+            new_art=pipeline.latest()
+            if new_art is not None and new_art is not incoming_art and new_art is not displayed_art:
+                incoming_art=new_art; crossfade_t=0; gen_count+=1
+
+            if incoming_art is not None:
+                alpha=crossfade_t/CROSSFADE_FRAMES
+                blended=crossfade(displayed_art if displayed_art is not None else placeholder,
+                                  incoming_art, alpha)
+                if crossfade_t>=CROSSFADE_FRAMES:
+                    displayed_art=incoming_art; incoming_art=None
+                else:
+                    crossfade_t+=1
+                right=blended
+            else:
+                right=displayed_art if displayed_art is not None else placeholder.copy()
 
             # Compose frame
             left=draw_pose(frame,persons,style)
             left=cv2.resize(left,(PANE_W,PANE_H))
-            art=pipeline.latest()
-            if art is not None: latest_art=art
-            right=latest_art if latest_art is not None else placeholder.copy()
+            right=cv2.resize(right,(PANE_W,PANE_H))
             composed=np.hstack([left,right])
 
             cam_fps=1.0/(sum(in_times)/len(in_times)+1e-9)
             hud_header(composed,style,len(persons),last_deepx_ms,cam_fps,pipeline.fps,pipeline.ready)
             hud_left(left,len(persons),last_deepx_ms,cam_fps,style)
-            hud_right(right,pipeline.fps,pipeline.ready,style)
+            hud_right(right,pipeline.fps,pipeline.ready,style,gen_count)
             draw_style_buttons(right,style)
-            draw_power_widget(left,last_deepx_ms)
             composed[:,:PANE_W]=left
             composed[:,PANE_W:]=right
 
@@ -724,19 +841,19 @@ def main():
             except BrokenPipeError:
                 print("[edge-art] Display pipe broken."); break
 
-            # Style cycle
+            # Auto style cycle (only if user hasn't touched recently)
             if time.time()-style_t0>STYLE_CYCLE_S:
                 style_idx=(style_idx+1)%len(STYLE_KEYS)
                 style=STYLE_KEYS[style_idx]; style_t0=time.time()
                 placeholder=make_placeholder(style)
-                print(f"[edge-art] style → {style}")
+                print(f"[edge-art] auto style → {style}")
 
             n_frames+=1
             if n_frames%30==0:
                 deepx_fps=1.0/(sum(npu_times)/len(npu_times)+1e-9)
                 print(f"[edge-art] {n_frames:5d}fr  cam {cam_fps:.1f}fps  "
                       f"deepx {deepx_fps:.1f}fps/{last_deepx_ms:.0f}ms  "
-                      f"genai {pipeline.fps:.2f}fps  people {len(persons)}")
+                      f"genai {pipeline.fps:.2f}fps  gen#{gen_count}  people {len(persons)}")
 
     except KeyboardInterrupt:
         print("\n[edge-art] Ctrl-C")
