@@ -52,21 +52,24 @@ def _svc(cmd, svc):
                            capture_output=True)
 
 
+def _stop_all():
+    for t in TILES:
+        _svc("stop", t["svc"])
+
+
 def launch(idx):
     global _running_svc
-    if _running_svc:
-        _svc("stop", _running_svc)
+    _stop_all()
     _running_svc = TILES[idx]["svc"]
-    _disp_close_evt.set()    # tell main loop to close display before demo starts
+    _disp_close_evt.set()
     time.sleep(0.3)
     _svc("start", _running_svc)
 
 
 def stop_demo():
     global _running_svc
-    if _running_svc:
-        _svc("stop", _running_svc)
-        _running_svc = ""
+    _stop_all()
+    _running_svc = ""
     _disp_reopen_evt.set()   # tell main loop to reopen display
 
 
