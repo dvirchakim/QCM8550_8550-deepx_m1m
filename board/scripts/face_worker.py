@@ -89,31 +89,44 @@ qnn.tflite_plugin_create_delegate.argtypes = [
 ]
 _delegate = qnn.tflite_plugin_create_delegate(_keys, _vals, 2, _err_fn)
 
-_model  = tfl.TfLiteModelCreateFromFile(MODEL.encode())
-_opts   = tfl.TfLiteInterpreterOptionsCreate()
-tfl.TfLiteInterpreterOptionsAddDelegate(_opts, _delegate)
-_interp = tfl.TfLiteInterpreterCreate(_model, _opts)
-tfl.TfLiteInterpreterAllocateTensors(_interp)
+_init_ok = False
+_interp = _in_ptr = _in_sz = None
+_out0_t = _out1_t = _out2_t = None
+_out0_sz = _out1_sz = _out2_sz = 0
+try:
+    _model = tfl.TfLiteModelCreateFromFile(MODEL.encode())
+    if not _model:
+        raise RuntimeError("TfLiteModelCreateFromFile returned null")
+    _opts = tfl.TfLiteInterpreterOptionsCreate()
+    tfl.TfLiteInterpreterOptionsAddDelegate(_opts, _delegate)
+    _interp = tfl.TfLiteInterpreterCreate(_model, _opts)
+    if not _interp:
+        raise RuntimeError("TfLiteInterpreterCreate returned null")
+    tfl.TfLiteInterpreterAllocateTensors(_interp)
 
-_in_t   = tfl.TfLiteInterpreterGetInputTensor(_interp, 0)
-_in_sz  = tfl.TfLiteTensorByteSize(_in_t)
-_in_ptr = tfl.TfLiteTensorData(_in_t)
+    _in_t   = tfl.TfLiteInterpreterGetInputTensor(_interp, 0)
+    _in_sz  = tfl.TfLiteTensorByteSize(_in_t)
+    _in_ptr = tfl.TfLiteTensorData(_in_t)
 
-_out0_t  = tfl.TfLiteInterpreterGetOutputTensor(_interp, 0)  # boxes  [8400,4] uint8
-_out1_t  = tfl.TfLiteInterpreterGetOutputTensor(_interp, 1)  # scores [8400]   uint8
-_out2_t  = tfl.TfLiteInterpreterGetOutputTensor(_interp, 2)  # cls    [8400]   uint8
-_out0_sz = tfl.TfLiteTensorByteSize(_out0_t)
-_out1_sz = tfl.TfLiteTensorByteSize(_out1_t)
-_out2_sz = tfl.TfLiteTensorByteSize(_out2_t)
+    _out0_t  = tfl.TfLiteInterpreterGetOutputTensor(_interp, 0)  # boxes  [8400,4] uint8
+    _out1_t  = tfl.TfLiteInterpreterGetOutputTensor(_interp, 1)  # scores [8400]   uint8
+    _out2_t  = tfl.TfLiteInterpreterGetOutputTensor(_interp, 2)  # cls    [8400]   uint8
+    _out0_sz = tfl.TfLiteTensorByteSize(_out0_t)
+    _out1_sz = tfl.TfLiteTensorByteSize(_out1_t)
+    _out2_sz = tfl.TfLiteTensorByteSize(_out2_t)
 
-# warmup (compile HTP graph on first invoke)
-_dummy = (ctypes.c_uint8 * _in_sz)()
-ctypes.memmove(_in_ptr, _dummy, _in_sz)
-tfl.TfLiteInterpreterInvoke(_interp)
-
-# restore pipe now that HTP init noise is fully suppressed
-os.dup2(_pipe_wfd, 1)
-os.close(_pipe_wfd)
+    # warmup (compile HTP graph on first invoke)
+    _dummy = (ctypes.c_uint8 * _in_sz)()
+    ctypes.memmove(_in_ptr, _dummy, _in_sz)
+    tfl.TfLiteInterpreterInvoke(_interp)
+    _init_ok = True
+except Exception as e:
+    sys.stderr.write(f"[face_worker] init failed: {e}\n")
+    sys.stderr.flush()
+finally:
+    # restore pipe regardless of init success so parent always gets READY
+    os.dup2(_pipe_wfd, 1)
+    os.close(_pipe_wfd)
 
 sys.stdout.buffer.write(b'READY\n')
 sys.stdout.buffer.flush()
@@ -142,6 +155,11 @@ while True:
     if not cmd or cmd == b'\x00':
         os._exit(0)  # skip ctypes teardown to avoid SIGSEGV
     if cmd != b'\x01':
+        continue
+
+    if not _init_ok:
+        sys.stdout.buffer.write(struct.pack('<i', 0))
+        sys.stdout.buffer.flush()
         continue
 
     try:
@@ -185,6 +203,21 @@ while True:
         boxes[:, 1] = np.clip((boxes[:, 1] - dy) / r, 0, CAM_H - 1)
         boxes[:, 2] = np.clip((boxes[:, 2] - dx) / r, 0, CAM_W - 1)
         boxes[:, 3] = np.clip((boxes[:, 3] - dy) / r, 0, CAM_H - 1)
+
+        # NMS to suppress overlapping detections
+        boxes_xywh = np.column_stack([
+            boxes[:, 0], boxes[:, 1],
+            boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
+        ])
+        indices = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), scores.tolist(), CONF_THR, 0.45)
+        if len(indices) == 0:
+            sys.stdout.buffer.write(struct.pack('<i', 0))
+            sys.stdout.buffer.flush()
+            continue
+        keep = np.array(indices).reshape(-1)
+        boxes   = boxes[keep]
+        scores  = scores[keep]
+        cls_ids = cls_ids[keep]
 
         n = len(boxes)
         buf = struct.pack('<i', n)

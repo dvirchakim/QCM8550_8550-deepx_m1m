@@ -56,7 +56,12 @@ try:
     opt.set_buffer_count(1)
 except Exception:
     pass
-engine = InferenceEngine(MODEL, opt)
+engine = None
+try:
+    engine = InferenceEngine(MODEL, opt)
+except Exception as e:
+    sys.stderr.write(f"[seg_worker] DEEPX init failed: {e}\n")
+    sys.stderr.flush()
 
 _pipe_out.write(b'READY\n')
 

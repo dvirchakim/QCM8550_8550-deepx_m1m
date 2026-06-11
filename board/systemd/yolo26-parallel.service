@@ -13,14 +13,15 @@ Environment=WAYLAND_DISPLAY=wayland-1
 Environment=QT_QPA_PLATFORM=wayland-egl
 Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
 
+ExecStartPre=/bin/sh -c 'pkill -9 yolo26_launcher gst-launch-1.0 2>/dev/null || true; sleep 1'
 ExecStartPre=/bin/sh -c 'cd /lib/modules/$(uname -r)/extra && insmod dxrt_driver.ko 2>/dev/null || true'
-ExecStartPre=/bin/sh -c 'pkill -9 gst-launch-1.0 2>/dev/null || true; sleep 1'
 ExecStart=/bin/sh /data/local/tmp/yolo26_parallel.sh
+ExecStop=/bin/sh -c 'pkill -9 yolo26_launcher gst-launch-1.0 2>/dev/null || true'
 
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=60
-TimeoutStopSec=15
+TimeoutStopSec=5
 KillMode=control-group
 
 StandardOutput=journal

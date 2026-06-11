@@ -25,7 +25,12 @@ try:
     opt.set_buffer_count(4)
 except Exception:
     pass
-engine = InferenceEngine(POSE_MODEL, opt)
+engine = None
+try:
+    engine = InferenceEngine(POSE_MODEL, opt)
+except Exception as e:
+    sys.stderr.write(f"[pose_worker] DEEPX init failed: {e}\n")
+    sys.stderr.flush()
 
 sys.stdout.buffer.write(b"READY\n")
 sys.stdout.buffer.flush()

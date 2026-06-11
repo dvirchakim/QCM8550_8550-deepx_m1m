@@ -11,8 +11,16 @@ insmod /lib/modules/$(uname -r)/extra/dxrt_driver.ko 2>/dev/null || true
 
 cd /usr/share/dx-stream
 
+cleanup() {
+    kill -9 $child 2>/dev/null
+    exit 0
+}
+trap cleanup TERM INT
+
 while true; do
-    /data/local/tmp/yolo26_launcher
+    /data/local/tmp/yolo26_launcher &
+    child=$!
+    wait $child
     echo "Launcher exited, restarting in 2s..."
     sleep 2
 done

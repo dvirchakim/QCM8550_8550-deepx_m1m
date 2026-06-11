@@ -37,8 +37,14 @@ _running_svc = ""
 
 
 def _svc(cmd, svc):
-    subprocess.run(["systemctl", cmd, svc],
-                   capture_output=True, timeout=10)
+    try:
+        subprocess.run(["systemctl", cmd, svc],
+                       capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        # force-kill any leftover processes if stop timed out
+        if cmd == "stop":
+            subprocess.run(["pkill", "-9", "-f", svc.replace(".service", "")],
+                           capture_output=True)
 
 
 def launch(idx):
@@ -104,6 +110,7 @@ def render(highlighted: int) -> np.ndarray:
 # ── GStreamer display ─────────────────────────────────────────────────────────
 
 def open_display():
+    import shlex
     cmd = (
         "gst-launch-1.0 -q fdsrc "
         "! rawvideoparse width=1920 height=1080 format=bgr framerate=30/1 "
@@ -111,7 +118,7 @@ def open_display():
         "! video/x-raw,format=BGRx "
         "! waylandsink fullscreen=true sync=false"
     )
-    return subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE)
+    return subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE)
 
 
 # ── Touch input ───────────────────────────────────────────────────────────────
@@ -165,6 +172,9 @@ def touch_thread():
         except BlockingIOError:
             time.sleep(0.005)
             continue
+        except OSError:
+            time.sleep(0.1)
+            continue
         if len(n) < sz:
             continue
         _, _, evtype, code, value = struct.unpack(fmt, n)
@@ -172,6 +182,7 @@ def touch_thread():
             if code in (ABS_X, ABS_MT_X):   tx = value
             if code in (ABS_Y, ABS_MT_Y):   ty = value
         if evtype == EV_KEY and code == BTN_TOUCH and value == 1:
+            print("[touch] BTN_TOUCH tx=%d ty=%d" % (tx, ty), flush=True)
             _tap_xy[0] = tx
             _tap_xy[1] = ty
             _tap_evt.set()
@@ -181,7 +192,9 @@ TOUCH_MAX_X = 1023
 TOUCH_MAX_Y = 599
 
 def tap_to_tile(tx, ty):
-    # Map raw touch coords (0-1023, 0-599) to screen tile index
+    # HOME button physically sits at top-left corner of touch panel (tx<80, ty<80)
+    if tx < 80 and ty < 80:
+        return -1
     x = tx * W // TOUCH_MAX_X
     y = ty * H // TOUCH_MAX_Y
     col = min(x // (W // 2), 1)
@@ -198,9 +211,10 @@ def main():
     t = threading.Thread(target=touch_thread, daemon=True)
     t.start()
 
-    highlighted = -1
-    hi_until    = 0.0
-    frame_bytes = W * H * 3
+    highlighted  = -1
+    hi_until     = 0.0
+    last_launch  = 0.0
+    DEBOUNCE     = 2.0   # seconds — ignore repeated touch events after a tap
 
     def cleanup(*_):
         disp.terminate()
@@ -213,13 +227,16 @@ def main():
     while True:
         if _tap_evt.is_set():
             _tap_evt.clear()
-            tx, ty = _tap_xy
-            tile = tap_to_tile(tx, ty)
-            if 0 <= tile < len(TILES):
-                highlighted = tile
-                hi_until    = time.time() + 0.6
-                print("[demo_picker] launching tile %d: %s" % (tile, TILES[tile]["svc"]), flush=True)
-                threading.Thread(target=launch, args=(tile,), daemon=True).start()
+            now = time.time()
+            if now - last_launch > DEBOUNCE:
+                tx, ty = _tap_xy
+                tile = tap_to_tile(tx, ty)
+                if 0 <= tile < len(TILES):
+                    last_launch = now
+                    highlighted = tile
+                    hi_until    = now + 0.6
+                    print("[demo_picker] launching tile %d: %s" % (tile, TILES[tile]["svc"]), flush=True)
+                    threading.Thread(target=launch, args=(tile,), daemon=True).start()
 
         if highlighted >= 0 and time.time() > hi_until:
             highlighted = -1

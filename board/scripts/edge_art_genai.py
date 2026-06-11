@@ -49,8 +49,8 @@ NMS_THR               = 0.45
 # SD config
 SD_W, SD_H   = 512, 512
 LAT_H, LAT_W = 64, 64
-SD_STEPS     = 6      # denoising steps (6 = ~36s with CFG)
-CFG_SCALE    = 7.5    # classifier-free guidance strength (0=off, 7.5=standard)
+SD_STEPS     = 12     # denoising steps (12 = ~72s with CFG — better detail than 6)
+CFG_SCALE    = 9.0    # classifier-free guidance (9.0 = strong style/prompt adherence)
 ADSP_PATH    = "/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp"
 
 # ---------------------------------------------------------------------------
@@ -58,25 +58,26 @@ ADSP_PATH    = "/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp"
 # CLIP vocab: BOS=49406, EOS/PAD=49407
 # ---------------------------------------------------------------------------
 TOKENIZED = {
-    "neon":    [49406, 13919, 36896, 10317, 2338, 267, 18437, 3418, 267, 5031,
-                1746, 537, 5496, 267, 33841, 4535, 49407] + [49407]*60,
-    "vangogh": [49406, 2451, 19697, 1220, 26493, 27969, 26595, 267, 2870, 3086,
-                267, 30963, 930, 1844, 267, 14270, 49407] + [49407]*60,
-    "comic":   [49406, 4962, 1116, 967, 6052, 267, 8911, 29159, 267, 1296, 3391,
-                637, 19019, 267, 2852, 794, 49407] + [49407]*60,
-    "noir":    [49406, 12953, 1860, 26149, 267, 11240, 12971, 267, 1449, 537,
-                1579, 267, 25602, 49407] + [49407]*63,
-    "neg":     [49406] + [49407]*76,
+    # "glowing neon cyberpunk warrior, holographic armor, ultra detailed, volumetric neon lighting, dark futuristic city, cinematic, 8k"
+    "neon":    [49406, 18437, 13919, 36896, 8148, 267, 10317, 4245, 16167, 267, 8118, 12609, 267, 3563, 19950, 13919, 5799, 267, 3144, 30987, 1305, 267, 25602, 267, 279, 330, 49407] + [49407]*50,
+    # "Van Gogh oil painting masterpiece, swirling impasto brushstrokes, vivid gold and blue palette, starry night sky, museum quality art"
+    "vangogh": [49406, 2451, 19697, 2870, 3086, 12066, 267, 1220, 26493, 732, 765, 5723, 27969, 26595, 267, 22984, 2209, 537, 1746, 13901, 267, 30963, 930, 2390, 267, 2786, 3027, 794, 49407] + [49407]*48,
+    # "Marvel comics superhero, dynamic action pose, bold ink outlines, vibrant halftone colors, dramatic perspective, epic illustration"
+    "comic":   [49406, 5996, 4256, 14049, 267, 10057, 1816, 4230, 267, 8911, 967, 29159, 267, 14270, 1296, 3391, 637, 5389, 267, 11240, 8996, 267, 4991, 6052, 49407] + [49407]*52,
+    # "cinematic film noir, dramatic chiaroscuro shadows, mysterious detective, black and white, 1940s Hollywood, moody atmosphere"
+    "noir":    [49406, 25602, 1860, 12953, 267, 11240, 1337, 516, 5092, 5925, 12971, 267, 12650, 13672, 267, 1449, 537, 1579, 267, 272, 280, 275, 271, 338, 5518, 267, 17170, 10506, 49407] + [49407]*48,
+    # negative: "blurry, distorted, low quality, ugly, deformed, disfigured, bad anatomy"
+    "neg":     [49406, 21977, 267, 23781, 775, 267, 1042, 3027, 267, 8159, 267, 561, 6528, 267, 1518, 15630, 267, 2103, 15376, 49407] + [49407]*57,
 }
 STYLE_KEYS    = ["neon", "vangogh", "comic", "noir"]
 STYLE_CYCLE_S = 30.0   # auto-cycle period (overridden by touch)
 CROSSFADE_FRAMES = 12  # art blend-in duration (frames)
 
 STYLE_LABELS = {
-    "neon":    "NEON CYBERPUNK",
-    "vangogh": "VAN GOGH",
-    "comic":   "COMIC INK",
-    "noir":    "FILM NOIR",
+    "neon":    "NEON CYBERPUNK WARRIOR",
+    "vangogh": "VAN GOGH MASTERPIECE",
+    "comic":   "MARVEL COMIC HERO",
+    "noir":    "CINEMATIC FILM NOIR",
 }
 
 # ---------------------------------------------------------------------------
@@ -209,7 +210,10 @@ class QNNRunner:
             "--use_native_input_files",
             "--use_native_output_files",
         ]
-        r = subprocess.run(cmd, capture_output=True, env=self._env)
+        try:
+            r = subprocess.run(cmd, capture_output=True, env=self._env, timeout=120)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"[{self.tag}] qnn-net-run timed out (>120s)")
         if r.returncode != 0:
             raise RuntimeError(
                 f"[{self.tag}] qnn-net-run failed:\n{r.stderr.decode(errors='replace')[-600:]}"
@@ -666,6 +670,7 @@ def _touch_thread_fn():
     while True:
         try: data=os.read(fd,sz)
         except BlockingIOError: time.sleep(0.005); continue
+        except OSError: time.sleep(0.1); continue
         if len(data)<sz: continue
         _,_,evtype,code,value=struct.unpack(fmt,data)
         if evtype==EV_ABS:
@@ -752,8 +757,11 @@ def main():
     opt=InferenceOption()
     try: opt.set_buffer_count(4)
     except: pass
-    engine=InferenceEngine(POSE_MODEL, opt)
-    print("[edge-art] DEEPX engine ready.")
+    try:
+        engine=InferenceEngine(POSE_MODEL, opt)
+        print("[edge-art] DEEPX engine ready.")
+    except Exception as e:
+        print(f"[edge-art] DEEPX init failed: {e}"); return 1
 
     print("[edge-art] Starting ControlNet pipeline ...")
     pipeline=ControlNetPipeline()
@@ -790,17 +798,28 @@ def main():
             t0=time.time()
             raw=read_exact(cam.stdout, cam_bytes)
             if raw is None:
-                print("[edge-art] Camera pipe closed."); break
+                print("[edge-art] Camera pipe closed — restarting ...")
+                try: cam.terminate(); cam.wait(timeout=2)
+                except Exception: cam.kill()
+                time.sleep(1.5)
+                cam=spawn_camera(0); time.sleep(1.5)
+                if cam.poll() is not None:
+                    print("[edge-art] Camera restart failed."); break
+                continue
             frame=np.frombuffer(raw,np.uint8).reshape(CAM_H,CAM_W,3)
             in_times.append(time.time()-t0)
 
             # DEEPX pose
             t1=time.time()
             lb,r,dx,dy=letterbox(frame,POSE_SIZE)
-            outs=engine.run(np.expand_dims(lb,0))
-            last_deepx_ms=(time.time()-t1)*1000.0
-            npu_times.append(last_deepx_ms/1000.0)
-            persons=decode_pose(outs[0].reshape(-1,57),r,dx,dy)
+            try:
+                outs=engine.run(np.expand_dims(lb,0))
+                persons=decode_pose(outs[0].reshape(-1,57),r,dx,dy)
+                last_deepx_ms=(time.time()-t1)*1000.0
+                npu_times.append(last_deepx_ms/1000.0)
+            except Exception as e:
+                print(f"[edge-art] DEEPX error: {e}")
+                persons=[]
 
             # Touch: interactive style switch
             with _touch_lock:
@@ -850,7 +869,11 @@ def main():
 
             try: disp.stdin.write(composed.tobytes())
             except BrokenPipeError:
-                print("[edge-art] Display pipe broken."); break
+                print("[edge-art] Display pipe broken — restarting ...")
+                try: disp.terminate(); disp.wait(timeout=2)
+                except Exception: disp.kill()
+                time.sleep(0.5)
+                disp=spawn_display(); time.sleep(0.5)
 
             # Auto style cycle (only if user hasn't touched recently)
             if time.time()-style_t0>STYLE_CYCLE_S:
@@ -872,7 +895,9 @@ def main():
         print("[edge-art] Shutting down ...")
         for p in (cam,disp):
             try: p.terminate(); p.wait(timeout=3)
-            except: p.kill()
+            except Exception:
+                try: p.kill(); p.wait(timeout=2)
+                except Exception: pass
         print(f"[edge-art] Done — {n_frames} frames.")
     return 0
 
