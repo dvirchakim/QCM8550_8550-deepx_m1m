@@ -64,7 +64,7 @@ def spawn_camera(cam_idx):
 def spawn_display():
     pipe = (f'gst-launch-1.0 -q fdsrc fd=0 ! '
             f'rawvideoparse format=bgr width={DISP_W} height={DISP_H} framerate={CAM_FPS}/1 ! '
-            f'videoconvert ! waylandsink sync=false fullscreen=true')
+            f'videoconvert ! video/x-raw,format=BGRx ! waylandsink sync=false fullscreen=true')
     return subprocess.Popen(shlex.split(pipe), stdin=subprocess.PIPE,
                             stderr=open('/tmp/dd_disp.log', 'w'),
                             env=_env(), bufsize=0)
