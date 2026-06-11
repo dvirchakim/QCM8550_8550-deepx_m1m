@@ -34,7 +34,8 @@ OCR_TEXT_FILE   = '/tmp/dd_ocr.txt'
 DUAL_DEEPX_WORKER = '/data/local/tmp/dual_deepx_worker.py'
 TROCR_WORKER      = '/data/local/tmp/trocr_worker.py'
 
-ADSP_PATH = '/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp'
+ADSP_PATH  = '/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp'
+ORT_PATH   = '/data/local/tmp/ort181'
 TROCR_INTERVAL_S = 8.0    # seconds between TrOCR inference runs
 
 CAM_BYTES = CAM_W * CAM_H * 3
@@ -162,11 +163,14 @@ _ocr_lock = threading.Lock()
 def trocr_thread():
     global _ocr_text
     time.sleep(5.0)   # let cameras settle first
+    trocr_env = os.environ.copy()
+    pp = trocr_env.get('PYTHONPATH', '')
+    trocr_env['PYTHONPATH'] = f'{ORT_PATH}:{pp}' if pp else ORT_PATH
     while True:
         try:
             r = subprocess.run(
                 ['python3', TROCR_WORKER, FRAME1_FILE, OCR_TEXT_FILE],
-                capture_output=False, timeout=120)
+                capture_output=False, env=trocr_env, timeout=300)
             if r.returncode == 0:
                 try:
                     with open(OCR_TEXT_FILE) as f:
