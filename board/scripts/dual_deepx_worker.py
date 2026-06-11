@@ -11,7 +11,7 @@ Protocol (binary):
     depth: writes /tmp/dd_depth_pane.bin  (960×1080×3)
     cls:   writes /tmp/dd_cls_pane.bin    (960×1080×3)
 """
-import os, signal, struct, sys, time
+import os, signal, struct, sys, threading, time
 import numpy as np
 import cv2
 
@@ -238,40 +238,67 @@ try:
 except Exception:
     pass
 
+def _warmup(engine, dummy, label, timeout_s=90):
+    """Run one inference in a thread; return True if it completes within timeout."""
+    done = threading.Event()
+    def _run():
+        try:
+            engine.run(dummy)
+        except Exception:
+            pass
+        done.set()
+    threading.Thread(target=_run, daemon=True).start()
+    ok = done.wait(timeout=timeout_s)
+    if not ok:
+        sys.stderr.write(f'[dual_deepx] {label} warmup HUNG (>{timeout_s}s) — disabled\n')
+        sys.stderr.flush()
+    else:
+        sys.stderr.write(f'[dual_deepx] {label} warmup OK\n')
+        sys.stderr.flush()
+    return ok
+
+
 depth_engine = cls_engine = None
-init_errors = []
 
 try:
     depth_engine = InferenceEngine(DEPTH_MODEL, opt)
-    sys.stderr.write('[dual_deepx] SCDepthV3 loaded\n')
+    sys.stderr.write('[dual_deepx] SCDepthV3 loaded — running warmup\n')
     sys.stderr.flush()
+    if not _warmup(depth_engine, np.zeros((1, DEPTH_H, DEPTH_W, 3), np.float32),
+                   'SCDepthV3'):
+        depth_engine = None
 except Exception as e:
-    init_errors.append(f'SCDepthV3: {e}')
+    sys.stderr.write(f'[dual_deepx] SCDepthV3 load failed: {e}\n')
+    sys.stderr.flush()
 
 try:
     cls_engine = InferenceEngine(CLS_MODEL, opt)
-    sys.stderr.write('[dual_deepx] YOLO26m-cls loaded\n')
+    sys.stderr.write('[dual_deepx] YOLO26m-cls loaded — running warmup\n')
     sys.stderr.flush()
+    if not _warmup(cls_engine, np.zeros((1, CLS_SIZE, CLS_SIZE, 3), np.float32),
+                   'YOLO26m-cls'):
+        cls_engine = None
 except Exception as e:
-    init_errors.append(f'YOLO26m-cls: {e}')
-
-for err in init_errors:
-    sys.stderr.write(f'[dual_deepx] init failed: {err}\n')
+    sys.stderr.write(f'[dual_deepx] YOLO26m-cls load failed: {e}\n')
     sys.stderr.flush()
 
+sys.stderr.write(f'[dual_deepx] depth_engine={depth_engine is not None} '
+                 f'cls_engine={cls_engine is not None}\n')
+sys.stderr.flush()
 _pipe_out.write(b'READY\n')
 
 # ── pre-allocate ───────────────────────────────────────────────────────────────
-_depth_inp = np.empty((DEPTH_H, DEPTH_W, 3), np.uint8)
-_cls_inp   = np.empty((CLS_SIZE, CLS_SIZE, 3), np.uint8)
+_depth_inp = np.empty((DEPTH_H, DEPTH_W, 3), np.float32)
+_cls_inp   = np.empty((CLS_SIZE, CLS_SIZE, 3), np.float32)
 _pane_buf  = np.empty((PANE_H, PANE_W, 3), np.uint8)
 
 def center_crop_resize(img, size):
     h, w = img.shape[:2]
     s = min(h, w)
     y0, x0 = (h - s) // 2, (w - s) // 2
-    cv2.resize(img[y0:y0+s, x0:x0+s], (size, size),
-               dst=_cls_inp, interpolation=cv2.INTER_AREA)
+    tmp = cv2.resize(img[y0:y0+s, x0:x0+s], (size, size),
+                     interpolation=cv2.INTER_AREA)
+    _cls_inp[:] = tmp.astype(np.float32) / 255.0
     return _cls_inp
 
 def softmax(x):
@@ -294,13 +321,20 @@ while True:
             _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
             continue
 
+        if depth_engine is None:
+            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(DEPTH_PANE_FILE)
+            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
+            continue
+
         try:
-            cv2.resize(raw, (DEPTH_W, DEPTH_H), dst=_depth_inp, interpolation=cv2.INTER_AREA)
+            tmp = cv2.resize(raw, (DEPTH_W, DEPTH_H), interpolation=cv2.INTER_AREA)
+            _depth_inp[:] = tmp.astype(np.float32) / 255.0
             t0 = time.time()
             outs = depth_engine.run(np.expand_dims(_depth_inp, 0))
             inf_ms = (time.time() - t0) * 1000.0
 
-            depth = outs[0].reshape(DEPTH_H, DEPTH_W).astype(np.float32)
+            # Output is (1,1,H,W) NCHW — squeeze to (H,W)
+            depth = outs[0].reshape(-1, DEPTH_H, DEPTH_W)[0].astype(np.float32)
             d_min, d_max = depth.min(), depth.max()
             if d_max > d_min:
                 depth_u8 = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
@@ -326,6 +360,11 @@ while True:
         try:
             raw = np.fromfile(FRAME1_FILE, dtype=np.uint8).reshape(CAM_H, CAM_W, 3)
         except Exception:
+            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(CLS_PANE_FILE)
+            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
+            continue
+
+        if cls_engine is None:
             np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(CLS_PANE_FILE)
             _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
             continue

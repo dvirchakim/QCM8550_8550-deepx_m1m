@@ -81,20 +81,31 @@ def _read_raw(path, dtype, shape):
 def _input_list(items):
     return ' '.join(f'{name}:={path}' for name, path in items)
 
-def run_snpe(dlc, input_items, out_dir):
+QNN_CPU_BACKEND = '/usr/lib/libQnnCpu.so'
+
+
+def run_qnn(dlc, input_items, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     list_path = os.path.join(out_dir, 'input_list.txt')
+    # qnn-net-run input list: one line, unnamed paths (tensor order matches model)
+    # For named inputs use "name:=/path" — same format as snpe-net-run
     with open(list_path, 'w') as f:
         f.write(_input_list(input_items) + '\n')
     cmd = [
-        'snpe-net-run',
-        '--container', dlc,
+        'qnn-net-run',
+        '--backend', QNN_CPU_BACKEND,
+        '--dlc_path', dlc,
         '--input_list', list_path,
         '--output_dir', out_dir,
     ]
-    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    r = subprocess.run(cmd, capture_output=True, timeout=120)
     if r.returncode != 0:
-        raise RuntimeError(f'snpe-net-run failed:\n{r.stderr.decode()[:500]}')
+        stderr = r.stderr.decode()[:800]
+        if '1002' in stderr or 'executable cache' in stderr:
+            raise RuntimeError(
+                '[TrOCR] QNN SDK version mismatch — DLC requires QAIRT 2.45, '
+                f'board has 2.41. ({stderr[:120]})')
+        raise RuntimeError(f'qnn-net-run failed:\n{stderr}')
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
@@ -131,10 +142,11 @@ def main():
     _write_raw(enc_in, px_vals)
 
     try:
-        run_snpe(ENCODER, [('pixel_values', enc_in)], enc_out)
+        run_qnn(ENCODER, [('pixel_values', enc_in)], enc_out)
     except Exception as e:
         print(f'[trocr] encoder failed: {e}', file=sys.stderr)
-        open(out_path, 'w').write('[encoder error]')
+        msg = str(e)[:120] if 'mismatch' in str(e) else '[encoder error]'
+        open(out_path, 'w').write(msg)
         return
 
     # Read cross-attention KV caches from encoder output
@@ -189,7 +201,7 @@ def main():
             input_items.append((name, p))
 
         try:
-            run_snpe(DECODER, input_items, dec_out_dir)
+            run_qnn(DECODER, input_items, dec_out_dir)
         except Exception as e:
             print(f'[trocr] decoder step {step} failed: {e}', file=sys.stderr)
             break
@@ -213,8 +225,10 @@ def main():
                 name_in  = f'kv_{layer}_attn_{kv}'
                 fpath = os.path.join(dec_out_dir, f'{name_out}.raw')
                 try:
-                    self_kv[name_in] = _read_raw(
-                        fpath, np.float32, (1, NUM_HEADS, KV_SEQ_SELF + 1, 32))
+                    # Decoder outputs [1,8,20,32]; next step input expects [1,8,19,32]
+                    # Use last 19 entries (drop oldest token) — sliding window
+                    updated = _read_raw(fpath, np.float32, (1, NUM_HEADS, KV_SEQ_SELF + 1, 32))
+                    self_kv[name_in] = updated[:, :, 1:, :]
                 except Exception:
                     pass
 

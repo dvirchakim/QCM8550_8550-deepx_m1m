@@ -13,7 +13,7 @@ Environment=WAYLAND_DISPLAY=wayland-1
 Environment=QT_QPA_PLATFORM=wayland-egl
 Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
 
-ExecStartPre=/bin/sh -c 'pkill -9 dual_deepx_worker trocr_worker gst-launch-1.0 2>/dev/null || true; sleep 2'
+ExecStartPre=/bin/sh -c 'systemctl stop yolo26-parallel.service imdt-deepx-demo.service 2>/dev/null || true; pkill -9 dual_deepx_worker trocr_worker seg_worker yolo26_launcher gst-launch-1.0 2>/dev/null || true; sleep 2'
 ExecStartPre=/bin/sh -c 'cd /lib/modules/$(uname -r)/extra && insmod dxrt_driver.ko 2>/dev/null || true'
 ExecStart=/bin/sh /data/local/tmp/deepx_dual.sh
 ExecStop=/bin/sh -c 'pkill -9 dual_deepx_worker trocr_worker gst-launch-1.0 2>/dev/null || true'

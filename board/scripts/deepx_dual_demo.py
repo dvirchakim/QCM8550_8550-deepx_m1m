@@ -120,14 +120,15 @@ def read_worker_response(proc):
 
 def ensure_worker(proc, script, tag):
     if proc is None or proc.poll() is not None:
-        print(f'[{tag}] (re)starting worker ...')
+        print(f'[{tag}] (re)starting worker (rc={proc.poll() if proc else None}) ...')
         try:
             if proc:
                 proc.kill()
         except OSError:
             pass
+        time.sleep(2)
         proc = spawn_worker(script)
-        if not wait_ready(proc, tag, timeout=90):
+        if not wait_ready(proc, tag, timeout=120):
             print(f'[{tag}] worker failed to become ready')
         return proc
     return proc
@@ -255,14 +256,17 @@ def main():
         t0 = time.time()
 
         # Alternate: even frames = depth, odd frames = cls (DXRT is single-access)
-        if frame_idx % 2 == 0:
-            deepx_w.stdin.write(b'\x01')   # depth
-            deepx_w.stdin.flush()
-            depth_ms = read_worker_response(deepx_w) or depth_ms
-        else:
-            deepx_w.stdin.write(b'\x02')   # cls
-            deepx_w.stdin.flush()
-            cls_ms = read_worker_response(deepx_w) or cls_ms
+        try:
+            if frame_idx % 2 == 0:
+                deepx_w.stdin.write(b'\x01')   # depth
+                deepx_w.stdin.flush()
+                depth_ms = read_worker_response(deepx_w) or depth_ms
+            else:
+                deepx_w.stdin.write(b'\x02')   # cls
+                deepx_w.stdin.flush()
+                cls_ms = read_worker_response(deepx_w) or cls_ms
+        except (BrokenPipeError, OSError):
+            pass
 
         deepx_w = ensure_worker(deepx_w, DUAL_DEEPX_WORKER, 'deepx')
 
