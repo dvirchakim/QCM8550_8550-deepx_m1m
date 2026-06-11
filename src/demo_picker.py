@@ -31,6 +31,10 @@ TILES = [
      "sub":   "DeepX Det  ||  DeepX Seg",
      "svc":   "yolo26-parallel.service",
      "color": ( 30, 160,  30)},   # green
+    {"label": "DeepX Dual",
+     "sub":   "SCDepth  ||  YOLO26-cls  +  TrOCR",
+     "svc":   "deepx-dual.service",
+     "color": ( 20, 180, 200)},   # teal
 ]
 
 _running_svc = ""
@@ -247,6 +251,9 @@ def main():
             disp.stdin.flush()
         except BrokenPipeError:
             print("[demo_picker] display pipe broken, restarting", flush=True)
+            try: disp.terminate(); disp.wait(timeout=2)
+            except Exception: disp.kill()
+            time.sleep(0.5)
             disp = open_display()
             time.sleep(0.5)
 
