@@ -38,6 +38,8 @@ TILES = [
 ]
 
 _running_svc = ""
+_disp_close_evt  = threading.Event()   # signals main loop to close display
+_disp_reopen_evt = threading.Event()   # signals main loop to reopen display
 
 
 def _svc(cmd, svc):
@@ -45,7 +47,6 @@ def _svc(cmd, svc):
         subprocess.run(["systemctl", cmd, svc],
                        capture_output=True, timeout=15)
     except subprocess.TimeoutExpired:
-        # force-kill any leftover processes if stop timed out
         if cmd == "stop":
             subprocess.run(["pkill", "-9", "-f", svc.replace(".service", "")],
                            capture_output=True)
@@ -56,7 +57,17 @@ def launch(idx):
     if _running_svc:
         _svc("stop", _running_svc)
     _running_svc = TILES[idx]["svc"]
+    _disp_close_evt.set()    # tell main loop to close display before demo starts
+    time.sleep(0.3)
     _svc("start", _running_svc)
+
+
+def stop_demo():
+    global _running_svc
+    if _running_svc:
+        _svc("stop", _running_svc)
+        _running_svc = ""
+    _disp_reopen_evt.set()   # tell main loop to reopen display
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
@@ -208,9 +219,28 @@ def tap_to_tile(tx, ty):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _detect_running_svc():
+    """Return the svc name of any demo that is currently active, or ''."""
+    for t in TILES:
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", t["svc"]],
+                capture_output=True, timeout=3)
+            if r.returncode == 0:
+                return t["svc"]
+        except Exception:
+            pass
+    return ""
+
+
 def main():
-    disp = open_display()
-    time.sleep(0.5)
+    global _running_svc
+    _running_svc = _detect_running_svc()
+
+    # Don't open our display if a demo is already on screen
+    disp = None if _running_svc else open_display()
+    if disp:
+        time.sleep(0.5)
 
     t = threading.Thread(target=touch_thread, daemon=True)
     t.start()
@@ -218,10 +248,18 @@ def main():
     highlighted  = -1
     hi_until     = 0.0
     last_launch  = 0.0
-    DEBOUNCE     = 2.0   # seconds — ignore repeated touch events after a tap
+    DEBOUNCE     = 2.0
+
+    def _close_disp(d):
+        if d is None:
+            return
+        try: d.terminate(); d.wait(timeout=2)
+        except Exception:
+            try: d.kill()
+            except Exception: pass
 
     def cleanup(*_):
-        disp.terminate()
+        _close_disp(disp)
         sys.exit(0)
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT,  cleanup)
@@ -229,6 +267,18 @@ def main():
     print("[demo_picker] running", flush=True)
 
     while True:
+        # Handle display close/reopen requests from launch()/stop_demo()
+        if _disp_close_evt.is_set():
+            _disp_close_evt.clear()
+            _close_disp(disp)
+            disp = None
+        if _disp_reopen_evt.is_set():
+            _disp_reopen_evt.clear()
+            _close_disp(disp)
+            time.sleep(0.5)
+            disp = open_display()
+            time.sleep(0.5)
+
         if _tap_evt.is_set():
             _tap_evt.clear()
             now = time.time()
@@ -241,9 +291,18 @@ def main():
                     hi_until    = now + 0.6
                     print("[demo_picker] launching tile %d: %s" % (tile, TILES[tile]["svc"]), flush=True)
                     threading.Thread(target=launch, args=(tile,), daemon=True).start()
+                elif tile == -1:
+                    # HOME button: stop active demo and show picker again
+                    print("[demo_picker] HOME → stopping demo", flush=True)
+                    last_launch = now
+                    threading.Thread(target=stop_demo, daemon=True).start()
 
         if highlighted >= 0 and time.time() > hi_until:
             highlighted = -1
+
+        if disp is None:
+            time.sleep(1.0 / 30.0)
+            continue
 
         frame = render(highlighted)
         try:
@@ -251,8 +310,7 @@ def main():
             disp.stdin.flush()
         except BrokenPipeError:
             print("[demo_picker] display pipe broken, restarting", flush=True)
-            try: disp.terminate(); disp.wait(timeout=2)
-            except Exception: disp.kill()
+            _close_disp(disp)
             time.sleep(0.5)
             disp = open_display()
             time.sleep(0.5)
