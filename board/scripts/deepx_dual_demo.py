@@ -16,7 +16,7 @@ Deploy:
     (push trocr/ dir separately)
 """
 from __future__ import annotations
-import os, shlex, signal, struct, subprocess, sys, threading, time
+import os, select, shlex, signal, struct, subprocess, sys, threading, time
 import cv2
 import numpy as np
 
@@ -39,6 +39,13 @@ ORT_PATH   = '/data/local/tmp/ort181'
 TROCR_INTERVAL_S = 8.0    # seconds between TrOCR inference runs
 
 CAM_BYTES = CAM_W * CAM_H * 3
+
+# Both cameras are captured by ONE gst-launch process and composited
+# side-by-side by the hardware qtivcomposer (cam0 | cam1). Two *separate*
+# qtiqmmfsrc client processes crash the shared qmmf-server, so a single
+# combined pipeline is the only stable way to run both cameras.
+COMBO_W, COMBO_H = CAM_W * 2, CAM_H        # 2560 x 720
+COMBO_BYTES      = COMBO_W * COMBO_H * 3
 PANE_BYTES = PANE_W * PANE_H * 3
 
 # ── Environment ────────────────────────────────────────────────────────────────
@@ -52,12 +59,30 @@ def _env():
     return e
 
 # ── GStreamer helpers ──────────────────────────────────────────────────────────
-def spawn_camera(cam_idx):
-    pipe = (f'gst-launch-1.0 -q qtiqmmfsrc camera={cam_idx} ! qtivtransform ! '
-            f'video/x-raw,width={CAM_W},height={CAM_H},format=NV12,framerate={CAM_FPS}/1 ! '
-            f'videoconvert ! video/x-raw,format=BGR ! fdsink fd=1 sync=false')
+def spawn_cameras():
+    """One process, both cameras, hardware-composited side-by-side (cam0|cam1).
+
+    qtivcomposer outputs QTI hardware memory, so a qtivtransform is required
+    after it before videoconvert can produce CPU-readable BGR. Leaky queues
+    prevent a slow consumer from stalling the cameras.
+    """
+    q = 'queue max-size-buffers=5 leaky=downstream'
+    cam = (lambda i: f'qtiqmmfsrc camera={i} ! qtivtransform ! '
+                     f'video/x-raw,width={CAM_W},height={CAM_H},format=NV12,'
+                     f'framerate={CAM_FPS}/1 ! {q} ! comp.sink_{i}')
+    pipe = (
+        f'gst-launch-1.0 -q {cam(0)} {cam(1)} '
+        f'qtivcomposer name=comp '
+        f'sink_0::position="<0,0>" sink_0::dimensions="<{CAM_W},{CAM_H}>" '
+        f'sink_1::position="<{CAM_W},0>" sink_1::dimensions="<{CAM_W},{CAM_H}>" ! '
+        f'qtivtransform ! video/x-raw,format=NV12,width={COMBO_W},height={COMBO_H} ! '
+        f'videoconvert ! video/x-raw,format=BGR ! '
+        # leaky queue here too: if Python consumes slowly, drop frames instead
+        # of back-pressuring (and stalling) the whole camera pipeline.
+        f'queue max-size-buffers=2 leaky=downstream ! fdsink fd=1 sync=false'
+    )
     return subprocess.Popen(shlex.split(pipe), stdout=subprocess.PIPE,
-                            stderr=open(f'/tmp/dd_cam{cam_idx}.log', 'w'),
+                            stderr=open('/tmp/dd_cam.log', 'w'),
                             env=_env(), bufsize=0)
 
 
@@ -140,20 +165,64 @@ _frame1 = None
 _frame_lock = threading.Lock()
 
 
-def cam_thread(cam_proc_ref, frame_file, cam_idx, lock, restart_fn):
+CAM_STALL_TIMEOUT = 5.0   # seconds without a frame → camera pipeline is dead
+
+
+def cam_thread(cam_proc_ref, restart_fn):
+    """Read combined cam0|cam1 frames from the single camera process, split
+    them, and write each half to its frame file.
+
+    A stall watchdog handles the case where qmmf-server crashes and the
+    gst-launch process hangs in PLAYING without closing stdout (a plain
+    blocking read would wait forever): we poll with select() and, if no frame
+    arrives for CAM_STALL_TIMEOUT, gracefully restart the pipeline.
+    """
+    proc = cam_proc_ref[0]
+    fd   = proc.stdout.fileno()
+    buf  = bytearray()
+    last_data = time.time()
+
+    def restart(reason):
+        nonlocal proc, fd, last_data
+        print(f'[cam] {reason} — restarting cameras ...', flush=True)
+        # Graceful SIGTERM first so qmmfsrc releases the cameras via
+        # qmmf-server; SIGKILL mid-stream wedges the HAL (qmmf-server SEGV).
+        try:
+            proc.terminate(); proc.wait(timeout=4)
+        except Exception:
+            try: proc.kill(); proc.wait(timeout=2)
+            except Exception: pass
+        time.sleep(1.5)
+        proc = restart_fn()
+        cam_proc_ref[0] = proc
+        fd = proc.stdout.fileno()
+        buf.clear()
+        last_data = time.time()
+        time.sleep(1.5)
+
     while True:
-        proc = cam_proc_ref[0]
-        raw = read_exact(proc.stdout, CAM_BYTES)
-        if raw is None:
-            print(f'[cam{cam_idx}] pipe closed — restarting ...')
-            try: proc.terminate(); proc.wait(timeout=2)
-            except Exception: proc.kill()
-            time.sleep(1.5)
-            cam_proc_ref[0] = restart_fn()
-            time.sleep(1.5)
-            continue
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape(CAM_H, CAM_W, 3)
-        arr.tofile(frame_file)
+        r, _, _ = select.select([fd], [], [], 1.0)
+        if r:
+            try:
+                chunk = os.read(fd, COMBO_BYTES - len(buf))
+            except OSError:
+                chunk = b''
+            if chunk:
+                last_data = time.time()
+                buf.extend(chunk)
+                if len(buf) >= COMBO_BYTES:
+                    combo = np.frombuffer(bytes(buf[:COMBO_BYTES]),
+                                          dtype=np.uint8).reshape(COMBO_H, COMBO_W, 3)
+                    combo[:, :CAM_W].tofile(FRAME0_FILE)   # cam0 (left)
+                    combo[:, CAM_W:].tofile(FRAME1_FILE)   # cam1 (right)
+                    del buf[:COMBO_BYTES]
+            else:
+                restart('pipe closed (EOF)')
+        else:
+            if proc.poll() is not None:
+                restart('process exited')
+            elif time.time() - last_data > CAM_STALL_TIMEOUT:
+                restart('no frames (camera service died)')
 
 # ── TrOCR background thread ────────────────────────────────────────────────────
 _ocr_text = 'Initializing TrOCR ...'
@@ -212,19 +281,15 @@ def main():
     if not wait_ready(deepx_w, 'deepx', timeout=180):
         print('[deepx-dual] dual_deepx_worker failed to start')
 
-    # Start cameras
-    cam0_ref = [spawn_camera(0)]
-    cam1_ref = [spawn_camera(1)]
-    time.sleep(1.5)
+    # Start BOTH cameras in one process (hardware-composited). Two separate
+    # qtiqmmfsrc client processes crash the shared qmmf-server.
+    cam_ref = [spawn_cameras()]
+    time.sleep(2.0)
 
-    # Camera capture threads (write to frame files)
+    # Single capture thread: reads cam0|cam1 frames, splits, writes both files
     threading.Thread(
         target=cam_thread,
-        args=(cam0_ref, FRAME0_FILE, 0, _frame_lock, lambda: spawn_camera(0)),
-        daemon=True).start()
-    threading.Thread(
-        target=cam_thread,
-        args=(cam1_ref, FRAME1_FILE, 1, _frame_lock, lambda: spawn_camera(1)),
+        args=(cam_ref, spawn_cameras),
         daemon=True).start()
 
     # TrOCR background thread
@@ -236,12 +301,16 @@ def main():
 
     def cleanup(*_):
         print('[deepx-dual] shutting down ...')
-        for p in [deepx_w, cam0_ref[0], cam1_ref[0], disp]:
+        # Graceful first — give qmmfsrc time to release the cameras so the HAL
+        # isn't left wedged (SIGKILL mid-stream causes a qmmf-server SEGV).
+        for p in [deepx_w, cam_ref[0], disp]:
             try: p.terminate()
             except Exception: pass
-        time.sleep(0.5)
-        for p in [deepx_w, cam0_ref[0], cam1_ref[0], disp]:
-            try: p.kill()
+        time.sleep(2.0)
+        for p in [deepx_w, cam_ref[0], disp]:
+            try:
+                if p.poll() is None:
+                    p.kill()
             except Exception: pass
         sys.exit(0)
 

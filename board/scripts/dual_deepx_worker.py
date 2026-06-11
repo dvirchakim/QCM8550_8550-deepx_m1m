@@ -291,6 +291,7 @@ _pipe_out.write(b'READY\n')
 _depth_inp = np.empty((DEPTH_H, DEPTH_W, 3), np.float32)
 _cls_inp   = np.empty((CLS_SIZE, CLS_SIZE, 3), np.float32)
 _pane_buf  = np.empty((PANE_H, PANE_W, 3), np.uint8)
+_clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 def center_crop_resize(img, size):
     h, w = img.shape[:2]
@@ -335,13 +336,21 @@ while True:
 
             # Output is (1,1,H,W) NCHW — squeeze to (H,W)
             depth = outs[0].reshape(-1, DEPTH_H, DEPTH_W)[0].astype(np.float32)
-            d_min, d_max = depth.min(), depth.max()
-            if d_max > d_min:
-                depth_u8 = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            # Percentile (robust) normalization — global min/max lets a few
+            # outlier pixels compress everything else into a flat band, which
+            # looks like shadowing instead of detailed depth. Clipping to the
+            # 2–98 percentile range restores contrast/detail.
+            lo = np.percentile(depth, 2.0)
+            hi = np.percentile(depth, 98.0)
+            if hi > lo:
+                norm = np.clip((depth - lo) / (hi - lo), 0.0, 1.0)
+                depth_u8 = (norm * 255.0).astype(np.uint8)
+                # mild contrast stretch (CLAHE) for local detail
+                depth_u8 = _clahe.apply(depth_u8)
             else:
                 depth_u8 = np.zeros((DEPTH_H, DEPTH_W), np.uint8)
 
-            colored = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+            colored = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
             cv2.resize(colored, (PANE_W, PANE_H), dst=_pane_buf, interpolation=cv2.INTER_LINEAR)
             cv2.putText(_pane_buf, 'SCDepthV3  (DEEPX)', (16, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
@@ -376,7 +385,15 @@ while True:
             inf_ms = (time.time() - t0) * 1000.0
 
             probs = softmax(outs[0].reshape(-1).astype(np.float32))
-            top5  = np.argsort(probs)[::-1][:TOP_K]
+            order = np.argsort(probs)[::-1]
+            n_labels = len(IMAGENET_LABELS)
+
+            def _label(i):
+                return IMAGENET_LABELS[i] if i < n_labels else f'class_{i}'
+
+            top_idx   = int(order[0])
+            top_label = _label(top_idx)
+            top_score = float(probs[top_idx])
 
             cv2.resize(raw, (PANE_W, PANE_H), dst=_pane_buf, interpolation=cv2.INTER_AREA)
             cv2.putText(_pane_buf, 'YOLO26m-cls  (DEEPX)', (16, 40),
@@ -384,19 +401,21 @@ while True:
             cv2.putText(_pane_buf, f'cam1  {inf_ms:.0f}ms', (16, 76),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
 
-            bar_y = PANE_H - 300
-            cv2.rectangle(_pane_buf, (0, bar_y), (PANE_W, PANE_H), (0, 0, 0), -1)
-            cv2.putText(_pane_buf, 'Top-5 Classification:', (16, bar_y + 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 220, 255), 1, cv2.LINE_AA)
-            n_labels = len(IMAGENET_LABELS)
-            for rank, idx in enumerate(top5):
-                label = IMAGENET_LABELS[idx] if idx < n_labels else f'class_{idx}'
-                score = float(probs[idx])
-                bw = int(score * (PANE_W - 32))
-                y = bar_y + 60 + rank * 48
-                cv2.rectangle(_pane_buf, (16, y), (16 + bw, y + 32), (30, 100, 200), -1)
-                cv2.putText(_pane_buf, f'{score:.2%}  {label}', (20, y + 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+            # Prominent top-1 prediction only, in the band ABOVE the TrOCR
+            # text strip (the demo overlays TrOCR on the bottom 160px).
+            bar_y = PANE_H - 320
+            cv2.rectangle(_pane_buf, (0, bar_y), (PANE_W, PANE_H - 160), (0, 0, 0), -1)
+            cv2.putText(_pane_buf, 'Top class:', (16, bar_y + 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1, cv2.LINE_AA)
+            # confidence bar
+            bw = int(top_score * (PANE_W - 32))
+            cv2.rectangle(_pane_buf, (16, bar_y + 44), (16 + bw, bar_y + 74),
+                          (40, 170, 80), -1)
+            cv2.putText(_pane_buf, f'{top_score:.1%}', (20, bar_y + 67),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            # big class name
+            cv2.putText(_pane_buf, top_label, (16, bar_y + 125),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (90, 230, 255), 3, cv2.LINE_AA)
 
             _pane_buf.tofile(CLS_PANE_FILE)
             _pipe_out.write(b'\x01' + struct.pack('<f', float(inf_ms)))
