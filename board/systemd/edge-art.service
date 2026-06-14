@@ -1,5 +1,5 @@
 [Unit]
-Description=Edge-Art GenAI Demo (DEEPX pose + ControlNet/SD1.5 on HTP)
+Description=Edge-Art Demo (DEEPX pose + Qualcomm HTP GenAI, C++ binary)
 Documentation=https://github.com/dvirchakim/QCM8550_8550-deepx_m1m
 Wants=init_qti_graphics.service init_display.service qmmf-server.service
 After=init_qti_graphics.service init_display.service qmmf-server.service
@@ -15,7 +15,7 @@ Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
 
 ExecStartPre=/bin/sh -c 'cd /lib/modules/$(uname -r)/extra && insmod dxrt_driver.ko 2>/dev/null || true'
 ExecStartPre=/bin/sh -c 'pkill -9 gst-launch-1.0 2>/dev/null || true; sleep 1'
-ExecStart=/bin/sh /data/local/tmp/run_genai_demo.sh
+ExecStart=/bin/sh /data/local/tmp/run_edge_art_boot.sh
 
 Restart=on-failure
 RestartSec=8

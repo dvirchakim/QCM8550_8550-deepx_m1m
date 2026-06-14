@@ -154,7 +154,7 @@ ABS_MT_Y = 0x36
 EVIOCGBIT_EV = 0x80084500   # EVIOCGBIT(0, 8) on aarch64
 
 def _find_touch():
-    for i in range(3):   # only event0/1/2 on this board
+    for i in range(10):  # scan event0 through event9
         p = "/dev/input/event%d" % i
         try:
             fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)

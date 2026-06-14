@@ -16,7 +16,7 @@ Deploy:
 """
 from __future__ import annotations
 
-import os, queue, struct, subprocess, sys, threading, time, shlex, ctypes
+import os, queue, select, struct, subprocess, sys, threading, time, shlex, ctypes
 from collections import deque
 from pathlib import Path
 
@@ -709,13 +709,29 @@ def crossfade(prev, next_, alpha):
 # ---------------------------------------------------------------------------
 # Camera / display subprocesses
 # ---------------------------------------------------------------------------
+def _slot_suffix() -> str:
+    """Read A/B slot suffix from kernel cmdline; fall back to _a."""
+    try:
+        cmdline = Path("/proc/cmdline").read_text()
+        for tok in cmdline.split():
+            if tok.startswith("androidboot.slot_suffix="):
+                return tok.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.environ.get("SLOT_SUFFIX", "_a")
+
+
 def _env():
-    e=os.environ.copy()
-    e["XDG_RUNTIME_DIR"]="/run/user/root"
-    e["WAYLAND_DISPLAY"]="wayland-1"
-    e["QT_QPA_PLATFORM"]="wayland-egl"
-    e["QT_WAYLAND_SHELL_INTEGRATION"]="wl-shell"
-    e["ADSP_LIBRARY_PATH"]=ADSP_PATH
+    e = os.environ.copy()
+    # XDG_RUNTIME_DIR must have trailing slash (matches qmmf-server / working gst-launch)
+    e["XDG_RUNTIME_DIR"] = "/run/user/root/"
+    e["WAYLAND_DISPLAY"] = "wayland-1"
+    e["QT_QPA_PLATFORM"] = "wayland-egl"
+    e["QT_WAYLAND_SHELL_INTEGRATION"] = "wl-shell"
+    e["ADSP_LIBRARY_PATH"] = ADSP_PATH
+    # SLOT_SUFFIX is required by libqmmf_camera_adaptor.so to build firmware paths;
+    # omitting it causes g_strlcat(path, NULL, ...) assertion failure inside the adaptor.
+    e["SLOT_SUFFIX"] = _slot_suffix()
     return e
 
 
@@ -735,12 +751,24 @@ def spawn_display():
                             stderr=open("/tmp/ea_disp.log","w"),env=_env(),bufsize=0)
 
 
-def read_exact(fp, n):
-    buf=bytearray()
-    while len(buf)<n:
-        chunk=fp.read(n-len(buf))
-        if not chunk: return None
+def read_exact(fp, n, timeout=8.0):
+    """Read exactly n bytes; return None on EOF or if no data arrives within timeout seconds."""
+    fd = fp.fileno()
+    buf = bytearray()
+    deadline = time.monotonic() + timeout
+    while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("[edge-art] Camera read timeout — GStreamer hung", flush=True)
+            return None
+        ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
+        if not ready:
+            continue
+        chunk = os.read(fd, n - len(buf))
+        if not chunk:
+            return None
         buf.extend(chunk)
+        deadline = time.monotonic() + timeout  # reset deadline on each good read
     return bytes(buf)
 
 
@@ -769,9 +797,8 @@ def main():
     # Touch input thread (for interactive style switching)
     threading.Thread(target=_touch_thread_fn,daemon=True).start()
 
-    subprocess.run(["systemctl","restart","qmmf-server.service"],
-                   check=False,stderr=subprocess.DEVNULL)
-    time.sleep(3.0)
+    # qmmf-server was already restarted by run_genai_demo.sh — just wait for it
+    time.sleep(2.0)
 
     cam=spawn_camera(0); time.sleep(1.5)
     if cam.poll() is not None:
@@ -798,13 +825,17 @@ def main():
             t0=time.time()
             raw=read_exact(cam.stdout, cam_bytes)
             if raw is None:
-                print("[edge-art] Camera pipe closed — restarting ...")
+                print("[edge-art] Camera pipe closed/hung — restarting ...", flush=True)
                 try: cam.terminate(); cam.wait(timeout=2)
                 except Exception: cam.kill()
-                time.sleep(1.5)
+                subprocess.run(["pkill","-9","gst-launch-1.0"],
+                               capture_output=True)
+                subprocess.run(["systemctl","restart","qmmf-server.service"],
+                               check=False,stderr=subprocess.DEVNULL)
+                time.sleep(8.0)
                 cam=spawn_camera(0); time.sleep(1.5)
                 if cam.poll() is not None:
-                    print("[edge-art] Camera restart failed."); break
+                    print("[edge-art] Camera restart failed.", flush=True); break
                 continue
             frame=np.frombuffer(raw,np.uint8).reshape(CAM_H,CAM_W,3)
             in_times.append(time.time()-t0)
