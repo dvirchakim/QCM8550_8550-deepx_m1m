@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-TrOCR text recognition worker — runs once per invocation.
+TrOCR text-recognition worker — PERSISTENT.
 
-Usage:
-    PYTHONPATH=/data/local/tmp/ort python3 trocr_worker.py <frame_bin> <output_txt>
+Loads the TrOCR encoder + decoder ONCE (onnxruntime, CPU) and then serves
+recognition requests over stdin/stdout. Previously this ran as a fresh
+subprocess every ~8s, re-loading ~245 MB of ONNX each time; keeping it resident
+removes that repeated load and makes the demo far more responsive.
 
-Reads a 1280x720 BGR uint8 frame binary, runs TrOCR encoder+decoder via
-onnxruntime (CPU), writes recognized text to output_txt.
+Run:
+    PYTHONPATH=/data/local/tmp/ort181 python3 trocr_worker.py
+
+Binary protocol (little-endian), main <-> worker:
+  worker -> main : b'READY\n' once both models are loaded
+  main -> worker : 0x01 + (CAM_H*CAM_W*3) uint8 BGR frame  -> recognize
+                   0x00                                      -> quit
+  worker -> main : 0x01 + int32 text_len + text_len bytes (utf-8)
 
 Model files (ONNX with external data):
-    /data/local/tmp/trocr/encoder.onnx  + encoder.data  (~92 MB)
-    /data/local/tmp/trocr/decoder.onnx  + decoder.data  (~153 MB)
-
-Encoder input : pixel_values [1,3,384,384] float32 RGB [0,1]  (NCHW)
-Encoder output: kv_cache_key/val_0..5  each [1,8,578,32]
-Decoder inputs: input_ids [1,1] int32, index [1] int32,
-                kv_{0-5}_attn_key/val [1,8,19,32] (self-attn, fixed window),
-                kv_{0-5}_cross_attn_key/val [1,8,578,32] (cross-attn, fixed)
-Decoder output: next_token [1] int32, kv_cache_key/val_0..5 [1,8,20,32]
+    /data/local/tmp/trocr/encoder.onnx + encoder.data  (~92 MB)
+    /data/local/tmp/trocr/decoder.onnx + decoder.data  (~153 MB)
 """
-import json, os, sys, time
+import json, os, signal, struct, sys, time
 import numpy as np
 import cv2
 
@@ -29,31 +30,83 @@ ENCODER    = f'{TROCR_DIR}/encoder.onnx'
 DECODER    = f'{TROCR_DIR}/decoder.onnx'
 VOCAB_FILE = f'{TROCR_DIR}/vocab.json'
 
-CAM_W, CAM_H  = 1280, 720
-ENC_W, ENC_H  = 384, 384
-BOS_ID        = 1
-EOS_ID        = 2
-MAX_TOKENS    = 20
-NUM_LAYERS    = 6
-NUM_HEADS     = 8
-KV_SEQ_CROSS  = 578
-KV_SEQ_SELF   = 19    # fixed self-attn window (decoder pads/slides)
+CAM_W, CAM_H = 1280, 720
+ENC_W, ENC_H = 384, 384
+START_ID     = 2          # decoder_start_token_id == eos_token_id == 2 (qai-hub)
+EOS_ID       = 2
+MAX_TOKENS   = 20
+NUM_LAYERS   = 6
+NUM_HEADS    = 8
+KV_SEQ_SELF  = 19
+FRAME_BYTES  = CAM_H * CAM_W * 3
+
+# onnxruntime can emit logs on stdout; keep a private result fd and send real
+# stdout to /dev/null so the binary channel stays clean.
+_pipe_wfd = os.dup(1)
+_devnull  = os.open('/dev/null', os.O_WRONLY)
+os.dup2(_devnull, 1)
+os.close(_devnull)
+_out = os.fdopen(_pipe_wfd, 'wb', buffering=0)
+_in  = sys.stdin.buffer
+
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
 
 
-def _setup_ort_path():
-    if ORT_PATH not in sys.path:
-        sys.path.insert(0, ORT_PATH)
+def _log(m):
+    sys.stderr.write(f'[trocr] {m}\n'); sys.stderr.flush()
+
+
+def read_exact(fp, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = fp.read(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+# ── PIL-style bicubic resize (transformers uses antialiased BICUBIC) ───────────
+def _cubic(x, a=-0.5):
+    x = np.abs(x); out = np.zeros_like(x)
+    m1 = x < 1.0; m2 = (x >= 1.0) & (x < 2.0)
+    out[m1] = ((a + 2.0) * x[m1] - (a + 3.0)) * x[m1] * x[m1] + 1.0
+    out[m2] = (((x[m2] - 5.0) * x[m2] + 8.0) * x[m2] - 4.0) * a
+    return out
+
+
+def _axis_weights(in_size, out_size, support=2.0):
+    scale = in_size / out_size; fscale = max(1.0, scale); rows = []
+    for o in range(out_size):
+        center = (o + 0.5) * scale
+        lo = int(np.floor(center - support * fscale))
+        hi = int(np.ceil(center + support * fscale))
+        idx = np.arange(lo, hi)
+        w = _cubic((idx - center + 0.5) / fscale)
+        idx = np.clip(idx, 0, in_size - 1)
+        s = w.sum()
+        if s != 0: w = w / s
+        rows.append((idx, w))
+    return rows
+
+
+def pil_bicubic_resize(img, out_w, out_h):
+    h, w = img.shape[:2]
+    x = img.astype(np.float32)
+    tmp = np.zeros((h, out_w, x.shape[2]), np.float32)
+    for o, (idx, wt) in enumerate(_axis_weights(w, out_w)):
+        tmp[:, o, :] = np.tensordot(x[:, idx, :], wt, axes=([1], [0]))
+    out = np.zeros((out_h, out_w, x.shape[2]), np.float32)
+    for o, (idx, wt) in enumerate(_axis_weights(h, out_h)):
+        out[o, :, :] = np.tensordot(tmp[idx, :, :], wt, axes=([0], [0]))
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
 def _load_vocab(path):
     try:
         with open(path) as f:
             data = json.load(f)
-        # tokenizer.json has nested {'model': {'vocab': {...}}}
-        if 'model' in data and isinstance(data['model'], dict):
-            vocab = data['model'].get('vocab', {})
-        else:
-            vocab = data   # flat {token_str: token_id}
+        vocab = data['model']['vocab'] if isinstance(data.get('model'), dict) else data
         return {int(v): k for k, v in vocab.items()}
     except Exception:
         return {}
@@ -61,8 +114,7 @@ def _load_vocab(path):
 
 def _bytes_to_text(tokens, id_to_tok):
     bs = list(range(ord('!'), ord('~')+1)) + list(range(ord('¡'), ord('¬')+1)) + list(range(ord('®'), ord('ÿ')+1))
-    cs = bs[:]
-    n = 0
+    cs = bs[:]; n = 0
     for b in range(256):
         if b not in bs:
             bs.append(b); cs.append(256 + n); n += 1
@@ -77,135 +129,101 @@ def _bytes_to_text(tokens, id_to_tok):
         return ''
 
 
-def main():
-    if len(sys.argv) < 3:
-        print(f'Usage: {sys.argv[0]} <frame.bin> <output.txt>')
-        sys.exit(1)
+# ── Load models once ───────────────────────────────────────────────────────────
+if ORT_PATH not in sys.path:
+    sys.path.insert(0, ORT_PATH)
+try:
+    import onnxruntime as ort
+except ImportError as e:
+    _log(f'onnxruntime missing (PYTHONPATH={ORT_PATH}): {e}')
+    os._exit(1)
 
-    frame_path = sys.argv[1]
-    out_path   = sys.argv[2]
+id_to_tok = _load_vocab(VOCAB_FILE)
+_opts = ort.SessionOptions()
+_opts.inter_op_num_threads = 4
+_opts.intra_op_num_threads = 4
 
-    _setup_ort_path()
-    try:
-        import onnxruntime as ort
-    except ImportError as e:
-        msg = f'[trocr] onnxruntime not found — set PYTHONPATH={ORT_PATH} ({e})'
-        print(msg, file=sys.stderr)
-        open(out_path, 'w').write(msg[:120])
-        return
+try:
+    _log('loading encoder ...')
+    enc_sess = ort.InferenceSession(ENCODER, sess_options=_opts, providers=['CPUExecutionProvider'])
+    _log('loading decoder ...')
+    dec_sess = ort.InferenceSession(DECODER, sess_options=_opts, providers=['CPUExecutionProvider'])
+except Exception as e:
+    _log(f'model load failed: {e}')
+    os._exit(1)
 
-    t_start = time.time()
+_enc_out_names = [o.name for o in enc_sess.get_outputs()]
+_dec_out_names = [o.name for o in dec_sess.get_outputs()]
+_dec_in_names  = [i.name for i in dec_sess.get_inputs()]
+_enc_in_names  = [i.name for i in enc_sess.get_inputs()]
+_log(f'ENC inputs : {_enc_in_names}')
+_log(f'ENC outputs: {_enc_out_names}')
+_log(f'DEC inputs : {_dec_in_names}')
+_log(f'DEC outputs: {_dec_out_names}')
+_log('models ready')
+_out.write(b'READY\n')
 
-    id_to_tok = _load_vocab(VOCAB_FILE)
 
-    try:
-        raw = np.fromfile(frame_path, dtype=np.uint8).reshape(CAM_H, CAM_W, 3)
-    except Exception as e:
-        print(f'[trocr] frame read failed: {e}', file=sys.stderr)
-        open(out_path, 'w').write('')
-        return
+def recognize(frame_bgr):
+    # TrOCR-printed reads a single text LINE. Crop the central horizontal band
+    # (where a user holds up printed text) so background doesn't trigger
+    # language-model hallucination.
+    h, w = frame_bgr.shape[:2]
+    y0, y1 = int(h * 0.32), int(h * 0.68)
+    band   = frame_bgr[y0:y1, :]
+    rgb_full = cv2.cvtColor(band, cv2.COLOR_BGR2RGB)
+    rgb      = pil_bicubic_resize(rgb_full, ENC_W, ENC_H).astype(np.float32) / 255.0
+    # TrOCR image processor: normalize with mean=0.5, std=0.5 -> range [-1, 1]
+    rgb      = (rgb - 0.5) / 0.5
+    px_vals  = rgb.transpose(2, 0, 1)[np.newaxis]   # [1,3,384,384]
 
-    # Preprocess: resize 384×384, BGR→RGB, normalize, NHWC→NCHW [1,3,384,384]
-    resized = cv2.resize(raw, (ENC_W, ENC_H), interpolation=cv2.INTER_AREA)
-    rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    px_vals = rgb.transpose(2, 0, 1)[np.newaxis]   # [1,3,384,384]
-
-    # ── Encoder ───────────────────────────────────────────────────────────────
-    print('[trocr] loading encoder ...', flush=True)
-    try:
-        opts = ort.SessionOptions()
-        opts.inter_op_num_threads = 4
-        opts.intra_op_num_threads = 4
-        enc_sess = ort.InferenceSession(ENCODER, sess_options=opts,
-                                        providers=['CPUExecutionProvider'])
-    except Exception as e:
-        msg = f'[trocr] encoder load failed: {e}'
-        print(msg, file=sys.stderr)
-        open(out_path, 'w').write(msg[:120])
-        return
-
-    print('[trocr] running encoder ...', flush=True)
-    try:
-        enc_outs = enc_sess.run(None, {'pixel_values': px_vals})
-    except Exception as e:
-        msg = f'[trocr] encoder inference failed: {e}'
-        print(msg, file=sys.stderr)
-        open(out_path, 'w').write(msg[:120])
-        return
-
-    enc_out_names = [o.name for o in enc_sess.get_outputs()]
+    enc_outs = enc_sess.run(None, {'pixel_values': px_vals})
     cross_kv = {}
-    for i, name in enumerate(enc_out_names):
-        # names: kv_cache_key_0..5 / kv_cache_val_0..5
-        # map to decoder input names: kv_{L}_cross_attn_{key|val}
-        if 'key' in name:
-            layer = name.split('_')[-1]
-            cross_kv[f'kv_{layer}_cross_attn_key'] = enc_outs[i]
-        else:
-            layer = name.split('_')[-1]
-            cross_kv[f'kv_{layer}_cross_attn_val'] = enc_outs[i]
+    for i, name in enumerate(_enc_out_names):
+        layer = name.split('_')[-1]
+        key = 'key' if 'key' in name else 'val'
+        cross_kv[f'kv_{layer}_cross_attn_{key}'] = enc_outs[i]
 
-    t_enc = time.time() - t_start
-    print(f'[trocr] encoder done in {t_enc:.1f}s', flush=True)
+    self_kv = {f'kv_{l}_attn_{kv}': np.zeros((1, NUM_HEADS, KV_SEQ_SELF, 32), np.float32)
+               for l in range(NUM_LAYERS) for kv in ('key', 'val')}
 
-    # ── Decoder ───────────────────────────────────────────────────────────────
-    print('[trocr] loading decoder ...', flush=True)
-    try:
-        dec_sess = ort.InferenceSession(DECODER, sess_options=opts,
-                                        providers=['CPUExecutionProvider'])
-    except Exception as e:
-        msg = f'[trocr] decoder load failed: {e}'
-        print(msg, file=sys.stderr)
-        open(out_path, 'w').write(msg[:120])
-        return
-
-    # Initialize self-attn KV cache (zeros)
-    self_kv = {}
-    for layer in range(NUM_LAYERS):
-        for kv in ('key', 'val'):
-            self_kv[f'kv_{layer}_attn_{kv}'] = np.zeros(
-                (1, NUM_HEADS, KV_SEQ_SELF, 32), np.float32)
-
-    generated   = []
-    current_id  = BOS_ID
-
+    generated, current_id = [], START_ID
     for step in range(MAX_TOKENS):
-        feed = {
-            'input_ids': np.array([[current_id]], dtype=np.int32),
-            'index':     np.array([step],         dtype=np.int32),
-        }
-        feed.update(self_kv)
-        feed.update(cross_kv)
-
-        try:
-            dec_outs = dec_sess.run(None, feed)
-        except Exception as e:
-            print(f'[trocr] decoder step {step} failed: {e}', file=sys.stderr)
+        feed = {'input_ids': np.array([[current_id]], np.int32),
+                'index':     np.array([step], np.int32)}
+        feed.update(self_kv); feed.update(cross_kv)
+        dec_outs = dec_sess.run(None, feed)
+        out_map  = dict(zip(_dec_out_names, dec_outs))
+        nxt = int(out_map['next_token'].flat[0])
+        if nxt == EOS_ID:
             break
-
-        dec_names  = [o.name for o in dec_sess.get_outputs()]
-        out_map    = dict(zip(dec_names, dec_outs))
-
-        next_token = int(out_map['next_token'].flat[0])
-        if next_token == EOS_ID:
-            break
-        generated.append(next_token)
-        current_id = next_token
-
-        # Update self-attn KV cache: output [1,8,20,32] → drop oldest → [1,8,19,32]
-        for layer in range(NUM_LAYERS):
+        generated.append(nxt); current_id = nxt
+        for l in range(NUM_LAYERS):
             for kv in ('key', 'val'):
-                out_name = f'kv_cache_{kv}_{layer}'
-                if out_name in out_map:
-                    self_kv[f'kv_{layer}_attn_{kv}'] = out_map[out_name][:, :, 1:, :]
+                o = f'kv_cache_{kv}_{l}'
+                if o in out_map:
+                    self_kv[f'kv_{l}_attn_{kv}'] = out_map[o][:, :, 1:, :]
 
-    text    = _bytes_to_text(generated, id_to_tok) if id_to_tok else str(generated)
-    elapsed = time.time() - t_start
-    print(f'[trocr] "{text}" ({elapsed:.1f}s, {len(generated)} tokens)', flush=True)
-
-    with open(out_path, 'w') as f:
-        f.write(text)
+    return _bytes_to_text(generated, id_to_tok) if id_to_tok else str(generated)
 
 
-if __name__ == '__main__':
-    main()
+# ── Serve requests ───────────────────────────────────────────────────────────
+while True:
+    cmd = _in.read(1)
+    if not cmd or cmd == b'\x00':
+        os._exit(0)
+    if cmd != b'\x01':
+        continue
+    payload = read_exact(_in, FRAME_BYTES)
+    if payload is None:
+        os._exit(0)
+    try:
+        frame = np.frombuffer(payload, np.uint8).reshape(CAM_H, CAM_W, 3)
+        t0 = time.time()
+        text = recognize(frame)
+        _log(f'"{text}" ({time.time()-t0:.1f}s)')
+    except Exception as e:
+        _log(f'recognize error: {e}')
+        text = ''
+    data = text.encode('utf-8')[:512]
+    _out.write(b'\x01' + struct.pack('<i', len(data)) + data)

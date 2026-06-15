@@ -1,426 +1,299 @@
 #!/usr/bin/env python3
 """
-Combined DEEPX worker — loads SCDepthV3 + YOLO26m-cls in one process
-to avoid concurrent DXRT device access from two processes.
+Combined DEEPX worker — SCDepthV3 (depth) + YOLOv5s-Face (detect) + 3DDFA_V2
+(3D face alignment), all in ONE process.
 
-Protocol (binary):
-  main → worker : 1 byte  (0x01 = run depth, 0x02 = run cls, 0x00 = quit)
-  worker → main : 1 byte 0x01 (done)
-                  float  inf_ms
-  Side effects:
-    depth: writes /tmp/dd_depth_pane.bin  (960×1080×3)
-    cls:   writes /tmp/dd_cls_pane.bin    (960×1080×3)
+Why one process: DXRT does not allow two processes to access the device
+concurrently. A single worker owns all three models. Depth and face-detection
+are submitted with run_async() so they execute IN PARALLEL across the DX-M1
+NPU cores (no frame alternating); 3DDFA then runs on the cropped face.
+
+INFERENCE-ONLY: receives raw uint8 model inputs over stdin, returns raw results
+over stdout. All rendering lives in the main demo process. No /tmp files.
+
+Binary protocol (little-endian), main <-> worker:
+  main -> worker:
+      0x01 + (DEPTH_H*DEPTH_W*3) uint8   depth input
+           + (FACE*FACE*3)       uint8   letterboxed face input (BGR, 640)
+      0x00 -> quit
+  worker -> main:
+      0x01 + float32 depth_ms + float32 face_ms
+           + (DEPTH_H*DEPTH_W) float32 depth map
+           + int32 has_face
+           + if has_face: 5*float32 (x1,y1,x2,y2,score) [in FACE coords]
+                          + 136*float32 landmarks (x,y)*68 [in FACE coords]
+  On error the worker still replies with a well-formed (zeroed) response.
 """
 import os, signal, struct, sys, threading, time
 import numpy as np
 import cv2
 
-# Suppress DXRT noise on fd-1
+# DXRT prints diagnostics to stdout; redirect real stdout to /dev/null and keep
+# a private duplicate for the binary result channel so it is never corrupted.
 _pipe_wfd = os.dup(1)
 _devnull  = os.open('/dev/null', os.O_WRONLY)
 os.dup2(_devnull, 1)
 os.close(_devnull)
-_pipe_out = os.fdopen(_pipe_wfd, 'wb', buffering=0)
+_out = os.fdopen(_pipe_wfd, 'wb', buffering=0)
+_in  = sys.stdin.buffer
 
 signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
 
 from dx_engine import InferenceEngine, InferenceOption
 
 DEPTH_MODEL      = '/data/local/tmp/scdepthv3.dxnn'
-CLS_MODEL        = '/data/local/tmp/yolo26m-cls.dxnn'
-FRAME0_FILE      = '/tmp/dd_frame0.bin'
-FRAME1_FILE      = '/tmp/dd_frame1.bin'
-DEPTH_PANE_FILE  = '/tmp/dd_depth_pane.bin'
-CLS_PANE_FILE    = '/tmp/dd_cls_pane.bin'
-CAM_W, CAM_H     = 1280, 720
+FACE_MODEL       = '/data/local/tmp/yolov5s_face.dxnn'
+TDDFA_MODEL      = '/data/local/tmp/3ddfa_v2.dxnn'
+BASES_NPZ        = '/data/local/tmp/face3d_bases.npz'
+
 DEPTH_W, DEPTH_H = 320, 256
-CLS_SIZE         = 224
-PANE_W, PANE_H   = 960, 1080
-TOP_K            = 5
+FACE             = 640                # YOLOv5s-Face input
+TDDFA_SIZE       = 120                # 3DDFA input
+N_LMK            = 68
 
-# ImageNet-1k labels (compact)
-IMAGENET_LABELS = (
-    'tench','goldfish','great white shark','tiger shark','hammerhead',
-    'electric ray','stingray','cock','hen','ostrich','brambling','goldfinch',
-    'house finch','junco','indigo bunting','American robin','bulbul','jay',
-    'magpie','chickadee','American dipper','kite','bald eagle','vulture',
-    'great grey owl','fire salamander','smooth newt','eft','spotted salamander',
-    'axolotl','American bullfrog','tree frog','tailed frog','loggerhead',
-    'leatherback turtle','mud turtle','terrapin','box turtle','banded gecko',
-    'green iguana','Carolina anole','desert grassland whiptail lizard',
-    'agama','frilled-neck lizard','alligator lizard','Gila monster',
-    'European green lizard','chameleon','Komodo dragon','Nile crocodile',
-    'American alligator','triceratops','worm snake','ring-necked snake',
-    'eastern hog-nosed snake','smooth green snake','kingsnake','garter snake',
-    'water snake','vine snake','night snake','boa constrictor','African rock python',
-    'Indian cobra','green mamba','sea snake','Saharan horned viper',
-    'eastern diamondback rattlesnake','sidewinder','trilobite','harvestman',
-    'scorpion','yellow garden spider','barn spider','European garden spider',
-    'southern black widow','tarantula','wolf spider','tick','centipede',
-    'black grouse','ptarmigan','ruffed grouse','prairie grouse','peacock',
-    'quail','partridge','grey parrot','macaw','sulphur-crested cockatoo',
-    'lorikeet','coucal','bee eater','hornbill','hummingbird','jacamar',
-    'toucan','duck','red-breasted merganser','goose','black swan','tusker',
-    'echidna','platypus','wallaby','koala','wombat','jellyfish','sea anemone',
-    'brain coral','flatworm','nematode','conch','snail','slug','sea slug',
-    'chiton','chambered nautilus','Dungeness crab','rock crab','fiddler crab',
-    'red king crab','American lobster','spiny lobster','crayfish','hermit crab',
-    'isopod','white stork','black stork','spoonbill','flamingo',
-    'little blue heron','great egret','bittern','crane','limpkin',
-    'common gallinule','American coot','bustard','ruddy turnstone',
-    'dunlin','common redshank','dowitcher','oystercatcher','pelican',
-    'king penguin','albatross','grey whale','killer whale','dugong',
-    'sea lion','Chihuahua','Japanese Chin','Maltese','Pekingese','Shih Tzu',
-    'King Charles Spaniel','Papillon','toy terrier','Rhodesian Ridgeback',
-    'Afghan Hound','Basset Hound','Beagle','Bloodhound','Bluetick Coonhound',
-    'Black and Tan Coonhound','Treeing Walker Coonhound','English foxhound',
-    'Redbone Coonhound','borzoi','Irish Wolfhound','Italian Greyhound',
-    'Whippet','Ibizan Hound','Norwegian Elkhound','Otterhound','Saluki',
-    'Scottish Deerhound','Weimaraner','Staffordshire Bull Terrier',
-    'American Staffordshire Terrier','Bedlington Terrier','Border Terrier',
-    'Kerry Blue Terrier','Irish Terrier','Norfolk Terrier','Norwich Terrier',
-    'Yorkshire Terrier','Wire Fox Terrier','Lakeland Terrier','Sealyham Terrier',
-    'Airedale Terrier','Cairn Terrier','Australian Terrier','Dandie Dinmont Terrier',
-    'Boston Terrier','Miniature Schnauzer','Giant Schnauzer','Standard Schnauzer',
-    'Scottish Terrier','Tibetan Terrier','Australian Silky Terrier',
-    'Soft-coated Wheaten Terrier','West Highland White Terrier','Lhasa Apso',
-    'Flat-Coated Retriever','Curly-coated Retriever','Golden Retriever',
-    'Labrador Retriever','Chesapeake Bay Retriever','German Shorthaired Pointer',
-    'Vizsla','English Setter','Irish Setter','Gordon Setter','Brittany',
-    'Clumber Spaniel','English Springer Spaniel','Welsh Springer Spaniel',
-    'Cocker Spaniels','Sussex Spaniel','Irish Water Spaniel','Kuvasz',
-    'Schipperke','Groenendael','Malinois','Briard','Australian Kelpie',
-    'Komondor','Old English Sheepdog','Shetland Sheepdog','collie',
-    'Border Collie','Bouvier des Flandres','Rottweiler','German Shepherd Dog',
-    'Dobermann','Miniature Pinscher','Greater Swiss Mountain Dog','Bernese Mountain Dog',
-    'Appenzeller Sennenhund','Entlebucher Sennenhund','Boxer','Bullmastiff',
-    'Tibetan Mastiff','French Bulldog','Great Dane','St. Bernard','husky',
-    'Alaskan Malamute','Siberian Husky','Dalmatian','Affenpinscher','Basenji',
-    'pug','Leonberger','Newfoundland dog','Pyrenean Mountain Dog','Samoyed',
-    'Pomeranian','Chow Chow','Keeshond','Brussels Griffon','Pembroke Welsh Corgi',
-    'Cardigan Welsh Corgi','Toy Poodle','Miniature Poodle','Standard Poodle',
-    'Mexican hairless dog','grey wolf','Alaskan tundra wolf','red wolf',
-    'coyote','dingo','dhole','African wild dog','hyena','red fox','kit fox',
-    'Arctic fox','grey fox','tabby cat','tiger cat','Persian cat','Siamese cat',
-    'Egyptian Mau','cougar','lynx','leopard','snow leopard','jaguar','lion',
-    'tiger','cheetah','brown bear','American black bear','polar bear',
-    'sloth bear','mongoose','meerkat','tiger beetle','ladybug','ground beetle',
-    'longhorn beetle','leaf beetle','dung beetle','rhinoceros beetle',
-    'weevil','fly','bee','ant','grasshopper','cricket','stick insect',
-    'cockroach','mantis','cicada','leafhopper','lacewing','dragonfly',
-    'damselfly','cabbage white butterfly','monarch butterfly','small white',
-    'sulphur butterfly','zebra longwing','sea cucumber','rabbit','hamster',
-    'squirrel','marmot','beaver','guinea pig','common sorrel','zebra',
-    'pig','wild boar','warthog','hippopotamus','ox','water buffalo','bison',
-    'ram','bighorn sheep','Alpine ibex','hartebeest','impala','gazelle',
-    'dromedary','llama','weasel','mink','European polecat','black-footed ferret',
-    'otter','skunk','badger','armadillo','three-toed sloth','orangutan',
-    'gorilla','chimpanzee','gibbon','siamang','guenon','patas monkey',
-    'baboon','macaque','langur','black-and-white colobus','proboscis monkey',
-    'marmoset','white-headed capuchin','howler monkey','titi monkey',
-    'Geoffroys spider monkey','common squirrel monkey','ring-tailed lemur',
-    'indri','Asian elephant','African bush elephant','red panda','giant panda',
-    'snoek','eel','coho salmon','rock beauty','clownfish','sturgeon',
-    'gar','lionfish','puffer fish','abacus','abaya','academic gown','accordion',
-    'acoustic guitar','aircraft carrier','airliner','airship','altar',
-    'ambulance','amphibious vehicle','analog clock','apiary','apron',
-    'trash can','assault rifle','backpack','bakery','balance beam','balloon',
-    'ballpoint pen','Band-Aid','banjo','baluster','barbershop','barn',
-    'barometer','barrel','wheelbarrow','baseball','basketball','bassinet',
-    'bassoon','swimcap','bath towel','bathtub','station wagon','lighthouse',
-    'beaker','military hat','beer bottle','beer glass','bell tower','baby bib',
-    'tandem bicycle','bikini','ring binder','binoculars','birdhouse',
-    'boathouse','bobsleigh','flask','bottlecap','hunting bow','bow tie',
-    'brass memorial plaque','bra','breakwater','breastplate','broom',
-    'bucket','buckle','bulletproof vest','high-speed train','butcher shop',
-    'taxicab','cauldron','candle','cannon','canoe','can opener','cardigan',
-    'car mirror','carousel','toolbox','cello','mobile phone','chain',
-    'chain-link fence','chain mail','chainsaw','chest','chiffonier','chime',
-    'china cabinet','Christmas stocking','church','movie theater','cleaver',
-    'cliff dwelling','cloak','clogs','cocktail shaker','coffee mug',
-    'coffeemaker','spiral galaxy','combination lock','computer keyboard',
-    'candy store','container ship','convertible','corkscrew','cornet',
-    'cowboy boot','cowboy hat','cradle','construction crane','crash helmet',
-    'crate','infant bed','Crock Pot','croquet ball','crutch','cuirass',
-    'dam','desk','desktop computer','rotary dial telephone','diaper',
-    'digital clock','digital watch','dining table','dishcloth','dishwasher',
-    'disc brake','dock','dog sled','dome','doormat','drilling rig','drum',
-    'drumstick','dumbbell','Dutch oven','electric fan','electric guitar',
-    'electric locomotive','entertainment center','envelope','espresso machine',
-    'face powder','feather boa','filing cabinet','fireboat','police van',
-    'fire truck','ambulance','flagpole','flute','folding chair',
-    'football helmet','forklift','fountain','fountain pen','four-poster bed',
-    'freight car','French horn','frying pan','fur coat','garbage truck',
-    'gas mask','gas pump','goblet','go-kart','golf ball','golf cart',
-    'gondola','gong','gown','grand piano','greenhouse','radiator grille',
-    'grocery store','guillotine','hair clip','hair spray','half-track',
-    'hammer','hamper','hair dryer','hand-held computer','handkerchief',
-    'hard disk drive','harmonica','harp','combine harvester','hatchet',
-    'holster','home theater','honeycomb','hook','hoop skirt',
-    'gymnastic horizontal bar','horse-drawn vehicle','hourglass','iPod',
-    'clothes iron','carved pumpkin','jeans','jeep','T-shirt','jigsaw puzzle',
-    'pulled rickshaw','joystick','kimono','knee pad','knot','lab coat',
-    'ladle','lampshade','laptop computer','lawn mower','lens cap',
-    'letter opener','library','lifeboat','lighter','limousine','ocean liner',
-    'lipstick','slip-on shoe','lotion','music speaker','magnetic compass',
-    'mailbag','mailbox','tights','one-piece bathing suit','manhole cover',
-    'maraca','marimba','mask','matchstick','maypole','maze','measuring cup',
-    'medicine cabinet','megalith','microphone','microwave oven',
-    'military uniform','milk can','minibus','miniskirt','minivan','missile',
-    'mitten','mixing bowl','mobile home','Model T','modem','monastery',
-    'monitor','moped','mortar','square academic cap','mosque','mosquito net',
-    'vespa','mountain bike','tent','computer mouse','mousetrap','moving van',
-    'muzzle','metal nail','neck brace','necklace','baby pacifier',
-    'notebook computer','obelisk','oboe','ocarina','odometer','oil filter',
-    'pipe organ','oscilloscope','overskirt','bullock cart','oxygen mask',
-    'product packet','paddle','paddle wheel','padlock','paintbrush','pajamas',
-    'palace','pan flute','paper towel','parachute','parallel bars',
-    'park bench','parking meter','railroad car','patio','payphone',
-    'pedestal','pencil case','pencil sharpener','perfume','Petri dish',
-    'photocopier','plectrum','Pickelhaube','picket fence','pickup truck',
-    'pier','piggy bank','pill bottle','pillow','ping-pong ball','pinwheel',
-    'pirate ship','pitcher','hand plane','planetarium','plastic bag',
-    'plate rack','farm plow','plunger','Polaroid camera','pole',
-    'police uniform','poncho','pool table','soda bottle','plant pot',
-    "potter's wheel",'power drill','prayer rug','printer','prison',
-    'missile','projectile','projector','hockey puck','punching bag','purse',
-    'quill','racing car','racket','radio','radio telescope','rain barrel',
-    'recreational vehicle','fishing casting reel','reflex camera',
-    'refrigerator','remote control','restaurant','revolver','rifle',
-    'rocking chair','rotisserie','eraser','rugby ball','ruler measuring stick',
-    'sneaker','safe','safety pin','salt shaker','sandal','sarong','saxophone',
-    'scabbard','weighing scale','school bus','schooner','scoreboard',
-    'sewing machine','shield','shoe store','shoji screen','shopping basket',
-    'shopping cart','shovel','shower cap','shower curtain','ski','balaclava',
-    'sleeping bag','slide rule','sliding door','slot machine','snorkel',
-    'snowmobile','snowplow','soap dispenser','soccer ball','sock',
-    'solar thermal collector','sombrero','soup bowl','keyboard space bar',
-    'space heater','space shuttle','spatula','motorboat','spider web',
-    'spindle','sports car','spotlight','stage','steam locomotive',
-    'through arch bridge','steel drum','stethoscope','scarf','stone wall',
-    'stopwatch','stove','strainer','tram','stretcher','couch','stupa',
-    'submarine','suit','sundial','sunglass','sunglasses','sunscreen',
-    'suspension bridge','mop','sweatshirt','swim trunks','swing','switch',
-    'syringe','table lamp','tank','tape player','teapot','teddy bear',
-    'television','tennis ball','thatched roof','front curtain','thimble',
-    'threshing machine','throne','tile roof','toaster','tobacco shop',
-    'toilet seat','torch','totem pole','tow truck','toy store','tractor',
-    'semi-trailer truck','tray','trench coat','tricycle','trimaran',
-    'tripod','triumphal arch','trolleybus','trombone','hot tub','turnstile',
-    'typewriter keyboard','umbrella','unicycle','upright piano',
-    'vacuum cleaner','vase','viaduct','violin','volleyball','waffle iron',
-    'wall clock','wallet','wardrobe','military aircraft','sink',
-    'washing machine','water bottle','water jug','water tower','whiskey jug',
-    'whistle','hair wig','window screen','window shade','Windsor tie',
-    'wine bottle','wing','wok','wooden spoon','wool','split-rail fence',
-    'shipwreck','sailboat','yurt','website','comic book','crossword',
-    'traffic sign','traffic light','dust jacket','menu','plate','guacamole',
-    'consomme','hot pot','trifle','ice cream','popsicle','baguette','bagel',
-    'pretzel','cheeseburger','hot dog','mashed potato','cabbage','broccoli',
-    'cauliflower','zucchini','spaghetti squash','acorn squash',
-    'butternut squash','cucumber','artichoke','bell pepper','mushroom',
-    'Granny Smith apple','strawberry','orange','lemon','fig','pineapple',
-    'banana','jackfruit','custard apple','pomegranate','hay','carbonara',
-    'chocolate syrup','dough','meatloaf','pizza','pot pie','burrito',
-    'red wine','espresso','tea cup','eggnog','alp','bubble','cliff',
-    'coral reef','geyser','lakeshore','promontory','sandbar','beach',
-    'valley','volcano','baseball player','bridegroom','scuba diver',
-    'rapeseed','daisy','yellow ladys slipper','corn','acorn','rose hip',
-    'horse chestnut seed','coral fungus','agaric','gyromitra',
-    'stinkhorn mushroom','earth star','hen of the woods','bolete',
-    'ear of corn','toilet paper',
-)
+DEPTH_IN_BYTES = DEPTH_H * DEPTH_W * 3
+FACE_IN_BYTES  = FACE * FACE * 3
 
-# ── init both engines sequentially ────────────────────────────────────────────
-opt = InferenceOption()
+FACE_CONF_THR  = 0.40
+FACE_NMS_THR   = 0.45
+
+
+def _log(msg):
+    sys.stderr.write(f'[dual_deepx] {msg}\n')
+    sys.stderr.flush()
+
+
+def read_exact(fp, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = fp.read(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+# ── 3DDFA reconstruction bases (sliced 68-keypoint BFM) ────────────────────────
 try:
-    opt.set_buffer_count(1)
-except Exception:
-    pass
+    _b = np.load(BASES_NPZ)
+    U_BASE     = _b['u_base'].astype(np.float32)        # (204, 1)
+    W_SHP_BASE = _b['w_shp_base'].astype(np.float32)    # (204, 40)
+    W_EXP_BASE = _b['w_exp_base'].astype(np.float32)    # (204, 10)
+    PARAM_MEAN = _b['param_mean'].astype(np.float32)    # (62,)
+    PARAM_STD  = _b['param_std'].astype(np.float32)     # (62,)
+    _log('face3d bases loaded')
+except Exception as e:
+    U_BASE = W_SHP_BASE = W_EXP_BASE = PARAM_MEAN = PARAM_STD = None
+    _log(f'face3d bases load failed: {e}')
+
+
+def parse_roi_box_from_bbox(bbox):
+    left, top, right, bottom = bbox[:4]
+    old_size = (right - left + bottom - top) / 2
+    cx = right - (right - left) / 2.0
+    cy = bottom - (bottom - top) / 2.0 + old_size * 0.14
+    size = int(old_size * 1.58)
+    return [cx - size / 2, cy - size / 2, cx - size / 2 + size, cy - size / 2 + size]
+
+
+def crop_img(img, roi_box):
+    h, w = img.shape[:2]
+    sx, sy, ex, ey = [int(round(v)) for v in roi_box]
+    dh, dw = ey - sy, ex - sx
+    res = np.zeros((dh, dw, 3), dtype=np.uint8)
+    dsx = -sx if sx < 0 else 0
+    sx  = max(sx, 0)
+    if ex > w: dex = dw - (ex - w); ex = w
+    else:      dex = dw
+    dsy = -sy if sy < 0 else 0
+    sy  = max(sy, 0)
+    if ey > h: dey = dh - (ey - h); ey = h
+    else:      dey = dh
+    res[dsy:dey, dsx:dex] = img[sy:ey, sx:ex]
+    return res
+
+
+def _parse_param(param):
+    R_ = param[:12].reshape(3, -1)
+    R = R_[:, :3]
+    offset = R_[:, -1].reshape(3, 1)
+    alpha_shp = param[12:52].reshape(-1, 1)
+    alpha_exp = param[52:].reshape(-1, 1)
+    return R, offset, alpha_shp, alpha_exp
+
+
+def similar_transform(pts3d, roi_box, size):
+    pts3d[0, :] -= 1
+    pts3d[2, :] -= 1
+    pts3d[1, :] = size - pts3d[1, :]
+    sx, sy, ex, ey = roi_box
+    scale_x = (ex - sx) / size
+    scale_y = (ey - sy) / size
+    pts3d[0, :] = pts3d[0, :] * scale_x + sx
+    pts3d[1, :] = pts3d[1, :] * scale_y + sy
+    s = (scale_x + scale_y) / 2
+    pts3d[2, :] *= s
+    pts3d[2, :] -= np.min(pts3d[2, :])
+    return pts3d.astype(np.float32)
+
+
+def recon_landmarks(param62, roi_box):
+    param = param62 * PARAM_STD + PARAM_MEAN
+    R, offset, a_shp, a_exp = _parse_param(param)
+    pts = (R @ (U_BASE + W_SHP_BASE @ a_shp + W_EXP_BASE @ a_exp)
+           .reshape(3, -1, order='F') + offset)
+    pts = similar_transform(pts, roi_box, TDDFA_SIZE)
+    return pts[:2].T.copy()      # (68, 2)
+
+
+def nms(boxes, scores, thr):
+    x1, y1 = boxes[:, 0], boxes[:, 1]
+    x2, y2 = boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size:
+        i = order[0]; keep.append(int(i))
+        if order.size == 1: break
+        xx1 = np.maximum(x1[i], x1[order[1:]]); yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]]); yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
+        order = order[1:][iou < thr]
+    return keep
+
+
+def decode_faces(raw):
+    """raw (25200,16): cx,cy,w,h,obj,lm(10),cls -> best face box [x1,y1,x2,y2], score."""
+    raw = raw.reshape(-1, 16)
+    conf = raw[:, 4] * raw[:, 15]
+    m = conf > FACE_CONF_THR
+    if not np.any(m):
+        return None
+    cand = raw[m]; sc = conf[m]
+    cx, cy, bw, bh = cand[:, 0], cand[:, 1], cand[:, 2], cand[:, 3]
+    boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
+    keep = nms(boxes, sc, FACE_NMS_THR)
+    bi = keep[int(np.argmax(sc[keep]))]
+    return boxes[bi], float(sc[bi])
+
+
+# ── Load engines (each with its own option so DXRT can spread across cores) ─────
+def _mk_opt():
+    o = InferenceOption()
+    try: o.set_buffer_count(2)
+    except Exception: pass
+    return o
+
 
 def _warmup(engine, dummy, label, timeout_s=90):
-    """Run one inference in a thread; return True if it completes within timeout."""
     done = threading.Event()
     def _run():
-        try:
-            engine.run(dummy)
-        except Exception:
-            pass
+        try: engine.run(dummy)
+        except Exception: pass
         done.set()
     threading.Thread(target=_run, daemon=True).start()
-    ok = done.wait(timeout=timeout_s)
-    if not ok:
-        sys.stderr.write(f'[dual_deepx] {label} warmup HUNG (>{timeout_s}s) — disabled\n')
-        sys.stderr.flush()
-    else:
-        sys.stderr.write(f'[dual_deepx] {label} warmup OK\n')
-        sys.stderr.flush()
-    return ok
+    if not done.wait(timeout=timeout_s):
+        _log(f'{label} warmup HUNG (>{timeout_s}s) — disabled')
+        return False
+    _log(f'{label} warmup OK')
+    return True
 
 
-depth_engine = cls_engine = None
-
+depth_engine = face_engine = tddfa_engine = None
 try:
-    depth_engine = InferenceEngine(DEPTH_MODEL, opt)
-    sys.stderr.write('[dual_deepx] SCDepthV3 loaded — running warmup\n')
-    sys.stderr.flush()
-    if not _warmup(depth_engine, np.zeros((1, DEPTH_H, DEPTH_W, 3), np.float32),
-                   'SCDepthV3'):
+    depth_engine = InferenceEngine(DEPTH_MODEL, _mk_opt())
+    _log('SCDepthV3 loaded — warming up')
+    if not _warmup(depth_engine, np.zeros((1, DEPTH_H, DEPTH_W, 3), np.uint8), 'SCDepthV3'):
         depth_engine = None
 except Exception as e:
-    sys.stderr.write(f'[dual_deepx] SCDepthV3 load failed: {e}\n')
-    sys.stderr.flush()
+    _log(f'SCDepthV3 load failed: {e}')
 
 try:
-    cls_engine = InferenceEngine(CLS_MODEL, opt)
-    sys.stderr.write('[dual_deepx] YOLO26m-cls loaded — running warmup\n')
-    sys.stderr.flush()
-    if not _warmup(cls_engine, np.zeros((1, CLS_SIZE, CLS_SIZE, 3), np.float32),
-                   'YOLO26m-cls'):
-        cls_engine = None
+    face_engine = InferenceEngine(FACE_MODEL, _mk_opt())
+    _log('YOLOv5s-Face loaded — warming up')
+    if not _warmup(face_engine, np.zeros((1, FACE, FACE, 3), np.uint8), 'YOLOv5s-Face'):
+        face_engine = None
 except Exception as e:
-    sys.stderr.write(f'[dual_deepx] YOLO26m-cls load failed: {e}\n')
-    sys.stderr.flush()
+    _log(f'YOLOv5s-Face load failed: {e}')
 
-sys.stderr.write(f'[dual_deepx] depth_engine={depth_engine is not None} '
-                 f'cls_engine={cls_engine is not None}\n')
-sys.stderr.flush()
-_pipe_out.write(b'READY\n')
+try:
+    tddfa_engine = InferenceEngine(TDDFA_MODEL, _mk_opt())
+    _log('3DDFA_V2 loaded — warming up')
+    if not _warmup(tddfa_engine, np.zeros((1, TDDFA_SIZE, TDDFA_SIZE, 3), np.uint8), '3DDFA_V2'):
+        tddfa_engine = None
+except Exception as e:
+    _log(f'3DDFA_V2 load failed: {e}')
 
-# ── pre-allocate ───────────────────────────────────────────────────────────────
-_depth_inp = np.empty((DEPTH_H, DEPTH_W, 3), np.float32)
-_cls_inp   = np.empty((CLS_SIZE, CLS_SIZE, 3), np.float32)
-_pane_buf  = np.empty((PANE_H, PANE_W, 3), np.uint8)
-_clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_log(f'depth={depth_engine is not None} face={face_engine is not None} '
+     f'tddfa={tddfa_engine is not None} bases={U_BASE is not None}')
+_out.write(b'READY\n')
 
-def center_crop_resize(img, size):
-    h, w = img.shape[:2]
-    s = min(h, w)
-    y0, x0 = (h - s) // 2, (w - s) // 2
-    tmp = cv2.resize(img[y0:y0+s, x0:x0+s], (size, size),
-                     interpolation=cv2.INTER_AREA)
-    _cls_inp[:] = tmp.astype(np.float32) / 255.0
-    return _cls_inp
 
-def softmax(x):
-    ex = np.exp(x - x.max())
-    return ex / ex.sum()
+# ── Main request loop ──────────────────────────────────────────────────────────
+_zeros_depth = np.zeros(DEPTH_H * DEPTH_W, np.float32)
 
-# ── main loop ─────────────────────────────────────────────────────────────────
-stdin_fd = sys.stdin.buffer
+
+def _reply(depth_ms, face_ms, depth_flat, face_box, score, landmarks):
+    resp = bytearray(b'\x01')
+    resp += struct.pack('<ff', float(depth_ms), float(face_ms))
+    resp += np.ascontiguousarray(depth_flat, np.float32).tobytes()
+    if face_box is None:
+        resp += struct.pack('<i', 0)
+    else:
+        resp += struct.pack('<i', 1)
+        resp += struct.pack('<5f', float(face_box[0]), float(face_box[1]),
+                            float(face_box[2]), float(face_box[3]), float(score))
+        resp += np.ascontiguousarray(landmarks.ravel(), np.float32).tobytes()
+    _out.write(bytes(resp))
+
+
 while True:
-    cmd = stdin_fd.read(1)
+    cmd = _in.read(1)
     if not cmd or cmd == b'\x00':
         os._exit(0)
+    if cmd != b'\x01':
+        continue
 
-    # ── Depth inference ───────────────────────────────────────────────────────
-    if cmd == b'\x01':
-        try:
-            raw = np.fromfile(FRAME0_FILE, dtype=np.uint8).reshape(CAM_H, CAM_W, 3)
-        except Exception:
-            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(DEPTH_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
-            continue
+    depth_payload = read_exact(_in, DEPTH_IN_BYTES)
+    face_payload  = read_exact(_in, FACE_IN_BYTES)
+    if depth_payload is None or face_payload is None:
+        os._exit(0)
 
-        if depth_engine is None:
-            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(DEPTH_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
-            continue
+    depth_flat = _zeros_depth
+    depth_ms = face_ms = 0.0
+    face_box = None; score = 0.0; landmarks = None
 
-        try:
-            tmp = cv2.resize(raw, (DEPTH_W, DEPTH_H), interpolation=cv2.INTER_AREA)
-            _depth_inp[:] = tmp.astype(np.float32) / 255.0
-            t0 = time.time()
-            outs = depth_engine.run(np.expand_dims(_depth_inp, 0))
-            inf_ms = (time.time() - t0) * 1000.0
+    try:
+        depth_in = np.frombuffer(depth_payload, np.uint8).reshape(1, DEPTH_H, DEPTH_W, 3)
+        face_img = np.frombuffer(face_payload, np.uint8).reshape(FACE, FACE, 3)
 
-            # Output is (1,1,H,W) NCHW — squeeze to (H,W)
-            depth = outs[0].reshape(-1, DEPTH_H, DEPTH_W)[0].astype(np.float32)
-            # Percentile (robust) normalization — global min/max lets a few
-            # outlier pixels compress everything else into a flat band, which
-            # looks like shadowing instead of detailed depth. Clipping to the
-            # 2–98 percentile range restores contrast/detail.
-            lo = np.percentile(depth, 2.0)
-            hi = np.percentile(depth, 98.0)
-            if hi > lo:
-                norm = np.clip((depth - lo) / (hi - lo), 0.0, 1.0)
-                depth_u8 = (norm * 255.0).astype(np.uint8)
-                # mild contrast stretch (CLAHE) for local detail
-                depth_u8 = _clahe.apply(depth_u8)
-            else:
-                depth_u8 = np.zeros((DEPTH_H, DEPTH_W), np.uint8)
+        # ── Submit depth + face IN PARALLEL across NPU cores ──────────────────
+        t0 = time.time()
+        depth_job = depth_engine.run_async(depth_in) if depth_engine else None
+        face_job  = face_engine.run_async(np.expand_dims(face_img, 0)) if face_engine else None
 
-            colored = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
-            cv2.resize(colored, (PANE_W, PANE_H), dst=_pane_buf, interpolation=cv2.INTER_LINEAR)
-            cv2.putText(_pane_buf, 'SCDepthV3  (DEEPX)', (16, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(_pane_buf, f'cam0  {inf_ms:.0f}ms', (16, 76),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
-            _pane_buf.tofile(DEPTH_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', float(inf_ms)))
-        except Exception as e:
-            sys.stderr.write(f'[dual_deepx] depth error: {e}\n')
-            sys.stderr.flush()
-            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(DEPTH_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
+        if depth_job is not None:
+            douts = depth_engine.wait(depth_job)
+            depth_flat = (douts[0].reshape(-1, DEPTH_H, DEPTH_W)[0]
+                          .astype(np.float32).ravel())
+        depth_ms = (time.time() - t0) * 1000.0
 
-    # ── Classification inference ───────────────────────────────────────────────
-    elif cmd == b'\x02':
-        try:
-            raw = np.fromfile(FRAME1_FILE, dtype=np.uint8).reshape(CAM_H, CAM_W, 3)
-        except Exception:
-            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(CLS_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
-            continue
+        if face_job is not None:
+            fouts = face_engine.wait(face_job)
+            face_ms = (time.time() - t0) * 1000.0
+            det = decode_faces(fouts[0].astype(np.float32))
+            if det is not None and tddfa_engine is not None and U_BASE is not None:
+                box, score = det
+                roi = parse_roi_box_from_bbox(box)
+                crop = crop_img(face_img, roi)
+                crop = cv2.resize(crop, (TDDFA_SIZE, TDDFA_SIZE),
+                                  interpolation=cv2.INTER_LINEAR)
+                touts = tddfa_engine.run(np.expand_dims(crop, 0))
+                param62 = touts[0].reshape(-1)[:62].astype(np.float32)
+                landmarks = recon_landmarks(param62, roi)
+                face_box = box
+    except Exception as e:
+        _log(f'infer error: {e}')
 
-        if cls_engine is None:
-            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(CLS_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
-            continue
-
-        try:
-            inp = center_crop_resize(raw, CLS_SIZE)
-            t0 = time.time()
-            outs = cls_engine.run(np.expand_dims(inp, 0))
-            inf_ms = (time.time() - t0) * 1000.0
-
-            probs = softmax(outs[0].reshape(-1).astype(np.float32))
-            order = np.argsort(probs)[::-1]
-            n_labels = len(IMAGENET_LABELS)
-
-            def _label(i):
-                return IMAGENET_LABELS[i] if i < n_labels else f'class_{i}'
-
-            top_idx   = int(order[0])
-            top_label = _label(top_idx)
-            top_score = float(probs[top_idx])
-
-            cv2.resize(raw, (PANE_W, PANE_H), dst=_pane_buf, interpolation=cv2.INTER_AREA)
-            cv2.putText(_pane_buf, 'YOLO26m-cls  (DEEPX)', (16, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(_pane_buf, f'cam1  {inf_ms:.0f}ms', (16, 76),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
-
-            # Prominent top-1 prediction only, in the band ABOVE the TrOCR
-            # text strip (the demo overlays TrOCR on the bottom 160px).
-            bar_y = PANE_H - 320
-            cv2.rectangle(_pane_buf, (0, bar_y), (PANE_W, PANE_H - 160), (0, 0, 0), -1)
-            cv2.putText(_pane_buf, 'Top class:', (16, bar_y + 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1, cv2.LINE_AA)
-            # confidence bar
-            bw = int(top_score * (PANE_W - 32))
-            cv2.rectangle(_pane_buf, (16, bar_y + 44), (16 + bw, bar_y + 74),
-                          (40, 170, 80), -1)
-            cv2.putText(_pane_buf, f'{top_score:.1%}', (20, bar_y + 67),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            # big class name
-            cv2.putText(_pane_buf, top_label, (16, bar_y + 125),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (90, 230, 255), 3, cv2.LINE_AA)
-
-            _pane_buf.tofile(CLS_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', float(inf_ms)))
-        except Exception as e:
-            sys.stderr.write(f'[dual_deepx] cls error: {e}\n')
-            sys.stderr.flush()
-            np.zeros((PANE_H, PANE_W, 3), np.uint8).tofile(CLS_PANE_FILE)
-            _pipe_out.write(b'\x01' + struct.pack('<f', 0.0))
+    _reply(depth_ms, face_ms, depth_flat, face_box, score, landmarks)
