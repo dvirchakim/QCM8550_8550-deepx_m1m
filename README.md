@@ -3,7 +3,7 @@
 **Board:** Qualcomm QCS8550 SBC (Snapdragon 8 Gen 2) + DeepX DX-M1 NPU module  
 **Kernel:** Linux 5.15.148-qki-consolidate · aarch64
 
-<img width="1536" height="2048" alt="Demo Picker on QCS8550" src="https://github.com/user-attachments/assets/1f4d4cc9-9de0-4ed7-84e8-9e17cf4b4dc9" />
+<img width="1664" height="2043" alt="Gemini_Generated_Image_576x19576x19576x" src="https://github.com/user-attachments/assets/432fa13d-b010-46c0-9248-fdce374f1bec" />
 
 ---
 
