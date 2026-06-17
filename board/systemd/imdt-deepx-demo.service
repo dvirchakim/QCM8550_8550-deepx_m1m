@@ -16,6 +16,7 @@ Environment=QT_QPA_PLATFORM=wayland-egl
 Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
 Requires=init_qti_graphics.service qmmf-server.service
 After=init_qti_graphics.service qmmf-server.service
+ExecStartPre=/bin/sh -c 'systemctl stop yolo26-parallel.service deepx-dual.service 2>/dev/null || true; pkill -9 yolo26_launcher dual_deepx_worker easyocr_worker gst-launch-1.0 2>/dev/null || true; sleep 2'
 ExecStart=/bin/sh -c '/bin/mount -o rw,remount "/" ; /usr/share/dx-stream/imdt-deepx-demo.sh'
 Restart=on-failure
 RestartSec=5

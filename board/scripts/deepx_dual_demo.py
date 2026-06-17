@@ -5,20 +5,19 @@ DeepX Dual Demo  —  IMDT QCS8550 + DEEPX DX-M1   (clean rebuild)
 2x2 quadrant layout (1920x1080), each quadrant 960x540:
 
   ┌────────────────────┬────────────────────┐
-  │ cam0  RGB           │ cam1  RGB + class   │   top
+  │ cam0  RGB           │ cam1  face mesh     │   top
   ├────────────────────┼────────────────────┤
-  │ cam0  SCDepthV3     │ TrOCR  text         │   bottom
+  │ cam0  SCDepthV3     │ EasyOCR  text       │   bottom
   └────────────────────┴────────────────────┘
-   DEEPX NPE-0 (depth)    DEEPX NPE-1 (cls)
-                          ONNX Runtime (TrOCR)
+   DEEPX (depth + face)   HTP detect + CPU read
 
 Architecture (hard-won constraints on this board):
   * BOTH cameras are captured by ONE gst-launch (qtivcomposer cam0|cam1).
     Two separate qtiqmmfsrc client processes crash the shared qmmf-server.
-  * ONE DeepX worker process owns both .dxnn models (DXRT is single-access);
-    the main loop alternates depth/cls requests.
-  * A separate, PERSISTENT TrOCR worker (ONNX Runtime, CPU) loads once and
-    serves frames on demand — no per-call model reload.
+  * ONE DeepX worker process owns the .dxnn models (DXRT is single-access);
+    the main loop alternates depth/face requests.
+  * A separate, PERSISTENT EasyOCR worker loads once: the CRAFT detector runs
+    on the Qualcomm HTP (qnn-net-run), the CRNN recognizer on the CPU.
   * All IPC is via pipes (no /tmp files); the main process owns ALL rendering.
   * Camera/display are separate gst processes — this works from a CLEAN boot
     (fresh camera HAL); never restart qmmf-server while streaming.
@@ -337,9 +336,9 @@ def panel_face(frame1, landmarks, score, ms):
     return p
 
 
-def panel_trocr(text):
+def panel_ocr(text):
     p = np.full((QUAD_H, QUAD_W, 3), 18, np.uint8)
-    _title(p, 'EasyOCR text recognition', 'ONNX Runtime')
+    _title(p, 'EasyOCR text recognition', 'HTP detect + CPU read')
     # strip non-ASCII — cv2.putText cannot render Unicode
     text_safe = ''.join(c for c in text if 32 <= ord(c) < 127)
     # word-wrap: ~40 chars fits comfortably at scale 1.0 on 960px panel
@@ -446,7 +445,7 @@ def main():
         tl = panel_rgb(f0, 'cam0  RGB', 'reference')
         tr = panel_face(f1, last_lmk, last_score, face_ms)
         bl = panel_depth(last_depth, depth_ms)
-        br = panel_trocr(ocr)
+        br = panel_ocr(ocr)
         canvas = compose(tl, tr, bl, br)
 
         try:

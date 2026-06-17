@@ -2,7 +2,11 @@
 
 These files live on the board at `/data/local/tmp/models/` and are **not tracked in git** (too large).
 
-## Files
+## Stable Diffusion binaries (legacy — Edge-Art removed)
+
+> The Edge-Art GenAI demo has been **removed**. These ~1.48 GB of Stable Diffusion QNN binaries
+> remain on the board at `/data/local/tmp/models/` but are **no longer used by any active demo**.
+> They are kept only so the GenAI pipeline can be revived later; delete them to reclaim space.
 
 | File | Size | Description |
 |---|---|---|
@@ -42,12 +46,6 @@ python -m qai_hub_models.models.controlnet_canny.export \
 adb push /tmp/controlnet_out/*.bin /data/local/tmp/models/
 ```
 
-## Runtime
-
-Executed by `edge_art_genai.py` via `qnn-net-run` subprocess:
-- Backend: `/usr/lib/libQnnHtp.so`
-- I/O staging: `/tmp/qnn_io/` and `/tmp/qnn_out/`
-- All quantization params hardcoded in `edge_art_genai.py` (uint16 affine)
 
 ## DEEPX DX-M1 Models
 

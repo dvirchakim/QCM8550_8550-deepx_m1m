@@ -2,13 +2,14 @@
 """
 demo_picker  --  Touchscreen demo selector for QCS8550 + DeepX DX-M1
 
-Tiles (2x2):
-  [Edge Art]        [OEM Reference]
-  [YOLO26 Parallel] [          ]
+Three full-width demo cards (what actually runs on the board):
+  01  Pose Estimation        DeepX YOLOv5-Pose  +  HTP YOLOv8
+  02  Instance Segmentation  DeepX YOLO26-SEG   +  HTP YOLOv8
+  03  Depth / Face / OCR     DeepX Depth+Face   +  HTP EasyOCR
 
 Display: GStreamer appsrc -> waylandsink (1920x1080 fullscreen)
 Touch:   /dev/input/event* ABS_X/Y + BTN_TOUCH
-Launch:  systemctl start/stop <service>
+Launch:  systemctl start/stop <service>  (one demo at a time)
 """
 import os, sys, signal, struct, subprocess, threading, time, ctypes
 import numpy as np
@@ -17,25 +18,37 @@ import cv2
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
 W, H = 1920, 1080
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# Accent colours are BGR. HTP chips share one amber accent; each demo owns a hue.
+HTP_COLOR = (60, 170, 255)   # amber
 
 TILES = [
-    {"label": "Edge Art",
-     "sub":   "DeepX Pose  +  Qualcomm GenAI",
-     "svc":   "edge-art.service",
-     "color": (210,  60, 180)},   # purple  (BGR)
-    {"label": "OEM Reference",
-     "sub":   "Qualcomm  +  DeepX  Pipeline",
+    {"label": "Pose Estimation",
+     "sub":   "Real-time human pose skeletons on two cameras",
      "svc":   "imdt-deepx-demo.service",
-     "color": (180, 120,   0)},   # blue
-    {"label": "YOLO26 Parallel",
-     "sub":   "DeepX Det  ||  DeepX Seg",
+     "accel": ("DeepX  YOLOv5-Pose", "HTP  YOLOv8"),
+     "color": (210, 140,  40)},   # blue
+    {"label": "Instance Segmentation",
+     "sub":   "Object masks on DeepX, detection on the Hexagon HTP",
      "svc":   "yolo26-parallel.service",
-     "color": ( 30, 160,  30)},   # green
-    {"label": "DeepX Dual",
-     "sub":   "SCDepth  ||  YOLO26-cls  +  TrOCR",
+     "accel": ("DeepX  YOLO26-SEG", "HTP  YOLOv8"),
+     "color": ( 70, 175,  60)},   # green
+    {"label": "Depth / Face / OCR",
+     "sub":   "Depth map + 3D face mesh on DeepX, live OCR on the HTP",
      "svc":   "deepx-dual.service",
-     "color": ( 20, 180, 200)},   # teal
+     "accel": ("DeepX  Depth+Face", "HTP  EasyOCR"),
+     "color": ( 90, 185, 220)},   # teal/amber
 ]
+
+# ── Layout ──────────────────────────────────────────────────────────────────
+HEADER_H = 110
+FOOTER_H = 70
+MARGIN_X = 60
+GAP      = 26
+AREA_TOP = HEADER_H + 24
+AREA_BOT = H - FOOTER_H - 14
+CARD_H   = (AREA_BOT - AREA_TOP - (len(TILES) - 1) * GAP) // len(TILES)
 
 _running_svc = ""
 _disp_close_evt  = threading.Event()   # signals main loop to close display
@@ -75,53 +88,98 @@ def stop_demo():
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
 
+def _rrect(img, p0, p1, color, r=22, thickness=-1):
+    """Filled or outlined rounded rectangle."""
+    x0, y0 = p0; x1, y1 = p1
+    r = max(1, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
+    if thickness < 0:
+        cv2.rectangle(img, (x0 + r, y0), (x1 - r, y1), color, -1)
+        cv2.rectangle(img, (x0, y0 + r), (x1, y1 - r), color, -1)
+        for cx, cy in ((x0+r, y0+r), (x1-r, y0+r), (x0+r, y1-r), (x1-r, y1-r)):
+            cv2.circle(img, (cx, cy), r, color, -1)
+    else:
+        t = thickness
+        cv2.line(img, (x0+r, y0), (x1-r, y0), color, t, cv2.LINE_AA)
+        cv2.line(img, (x0+r, y1), (x1-r, y1), color, t, cv2.LINE_AA)
+        cv2.line(img, (x0, y0+r), (x0, y1-r), color, t, cv2.LINE_AA)
+        cv2.line(img, (x1, y0+r), (x1, y1-r), color, t, cv2.LINE_AA)
+        cv2.ellipse(img, (x0+r, y0+r), (r, r), 180, 0, 90, color, t, cv2.LINE_AA)
+        cv2.ellipse(img, (x1-r, y0+r), (r, r), 270, 0, 90, color, t, cv2.LINE_AA)
+        cv2.ellipse(img, (x0+r, y1-r), (r, r),  90, 0, 90, color, t, cv2.LINE_AA)
+        cv2.ellipse(img, (x1-r, y1-r), (r, r),   0, 0, 90, color, t, cv2.LINE_AA)
+
+
+def _chip(img, x_right, y_center, text, color):
+    """Right-aligned pill badge. Returns its left x (for stacking)."""
+    fs, th = 0.6, 1
+    (tw, tht), _ = cv2.getTextSize(text, FONT, fs, th)
+    padx, pady = 18, 12
+    w, h = tw + 2*padx, tht + 2*pady
+    x1, x0 = x_right, x_right - w
+    y0, y1 = y_center - h//2, y_center - h//2 + h
+    _rrect(img, (x0, y0), (x1, y1), (44, 40, 48), r=h//2, thickness=-1)
+    _rrect(img, (x0, y0), (x1, y1), color, r=h//2, thickness=2)
+    cv2.putText(img, text, (x0+padx, y1-pady-1), FONT, fs, color, th, cv2.LINE_AA)
+    return x0
+
+
 def render(highlighted: int) -> np.ndarray:
-    frame = np.full((H, W, 3), 20, dtype=np.uint8)
-
-    TW, TH = W // 2, H // 2
-    PAD = 20
-
-    for i, t in enumerate(TILES):
-        col = i % 2
-        row = i // 2
-        x0, y0 = col * TW + PAD, row * TH + PAD
-        x1, y1 = x0 + TW - 2*PAD, y0 + TH - 2*PAD
-
-        active = (_running_svc == t["svc"])
-        hi     = (highlighted == i)
-        scale  = 1.35 if hi else (0.85 if active else 1.0)
-        bgr    = tuple(min(255, int(c * scale)) for c in t["color"])
-
-        cv2.rectangle(frame, (x0, y0), (x1, y1), bgr, -1)
-        bdr = (255, 255, 255) if active else t["color"]
-        thick = 5 if active else 3
-        cv2.rectangle(frame, (x0, y0), (x1, y1), bdr, thick)
-
-        # Label
-        fs = 1.6
-        (tw, th), _ = cv2.getTextSize(t["label"], cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
-        tx = x0 + (TW - 2*PAD - tw) // 2
-        ty = y0 + (TH - 2*PAD) // 2 - 10
-        cv2.putText(frame, t["label"], (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-
-        # Subtitle
-        fs2 = 0.58
-        (sw, _), _ = cv2.getTextSize(t["sub"], cv2.FONT_HERSHEY_SIMPLEX, fs2, 1)
-        sx = x0 + (TW - 2*PAD - sw) // 2
-        sy = ty + 36
-        cv2.putText(frame, t["sub"], (sx, sy),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs2,
-                    t["color"], 1, cv2.LINE_AA)
+    frame = np.full((H, W, 3), 16, dtype=np.uint8)
 
     # Header
-    cv2.rectangle(frame, (0, 0), (W, 44), (12, 12, 12), -1)
-    cv2.putText(frame,
-                "Touch a panel to launch the chosen demo.",
-                (22, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (160, 160, 160), 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (0, 0), (W, HEADER_H), (26, 22, 21), -1)
+    cv2.line(frame, (0, HEADER_H), (W, HEADER_H), (62, 54, 52), 1)
+    cv2.putText(frame, "AI Demo Station", (MARGIN_X, 70),
+                FONT, 1.5, (242, 242, 248), 2, cv2.LINE_AA)
+    sub = "Qualcomm QCS8550    .    DeepX DX-M1 NPU    .    Hexagon HTP"
+    (sw, _), _ = cv2.getTextSize(sub, FONT, 0.7, 1)
+    cv2.putText(frame, sub, (W - MARGIN_X - sw, 66),
+                FONT, 0.7, (150, 150, 165), 1, cv2.LINE_AA)
 
+    for i, t in enumerate(TILES):
+        x0, x1 = MARGIN_X, W - MARGIN_X
+        y0 = AREA_TOP + i * (CARD_H + GAP)
+        y1 = y0 + CARD_H
+        active = (_running_svc == t["svc"])
+        hi     = (highlighted == i)
+
+        if hi:
+            base = tuple(min(255, int(c*0.45) + 32) for c in t["color"])
+        elif active:
+            base = tuple(min(255, int(c*0.28) + 24) for c in t["color"])
+        else:
+            base = (40, 34, 33)
+        _rrect(frame, (x0, y0), (x1, y1), base, r=22, thickness=-1)
+        _rrect(frame, (x0, y0), (x1, y1),
+               (255, 255, 255) if active else t["color"], r=22,
+               thickness=3 if active else 2)
+
+        # Left accent bar
+        cv2.rectangle(frame, (x0+7, y0+22), (x0+17, y1-22), t["color"], -1)
+
+        cy = y0 + CARD_H // 2
+        cv2.putText(frame, "%02d" % (i+1), (x0+48, cy+26),
+                    FONT, 2.4, t["color"], 3, cv2.LINE_AA)
+
+        tx = x0 + 210
+        cv2.putText(frame, t["label"], (tx, cy-4),
+                    FONT, 1.35, (245, 245, 250), 2, cv2.LINE_AA)
+        cv2.putText(frame, t["sub"], (tx, cy+44),
+                    FONT, 0.7, (168, 168, 182), 1, cv2.LINE_AA)
+        if active:
+            cv2.putText(frame, "RUNNING", (tx, y0+42),
+                        FONT, 0.62, (120, 232, 140), 1, cv2.LINE_AA)
+
+        # Accelerator chips (right-aligned: DeepX hue + HTP amber)
+        left = _chip(frame, x1 - 30, cy, t["accel"][1], HTP_COLOR)
+        _chip(frame, left - 16, cy, t["accel"][0], t["color"])
+
+    # Footer
+    cv2.rectangle(frame, (0, H-FOOTER_H), (W, H), (26, 22, 21), -1)
+    cv2.line(frame, (0, H-FOOTER_H), (W, H-FOOTER_H), (62, 54, 52), 1)
+    cv2.putText(frame,
+                "Tap a card to launch a demo        HOME (top-left corner) to stop and return",
+                (MARGIN_X, H-26), FONT, 0.7, (150, 150, 165), 1, cv2.LINE_AA)
     return frame
 
 
@@ -213,11 +271,13 @@ def tap_to_tile(tx, ty):
     # HOME button physically sits at top-left corner of touch panel (tx<80, ty<80)
     if tx < 80 and ty < 80:
         return -1
-    x = tx * W // TOUCH_MAX_X
     y = ty * H // TOUCH_MAX_Y
-    col = min(x // (W // 2), 1)
-    row = min(y // (H // 2), 1)
-    return row * 2 + col
+    if y < AREA_TOP - 10:
+        return -2          # header tap — ignore
+    idx = (y - AREA_TOP) // (CARD_H + GAP)
+    if 0 <= idx < len(TILES):
+        return int(idx)
+    return -2              # gap / footer — ignore
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

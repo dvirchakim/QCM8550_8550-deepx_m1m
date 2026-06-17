@@ -14,7 +14,7 @@ Environment=QT_QPA_PLATFORM=wayland-egl
 Environment=QT_WAYLAND_SHELL_INTEGRATION=wl-shell
 
 ExecStartPre=/bin/sh -c 'chmod +x /data/local/tmp/demo_picker'
-ExecStartPre=/bin/sh -c 'systemctl stop edge-art.service imdt-deepx-demo.service yolo26-parallel.service deepx-dual.service 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'systemctl stop imdt-deepx-demo.service yolo26-parallel.service deepx-dual.service 2>/dev/null || true'
 ExecStart=/data/local/tmp/demo_picker
 
 Restart=always
