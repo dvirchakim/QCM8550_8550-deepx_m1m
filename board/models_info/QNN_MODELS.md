@@ -13,6 +13,23 @@ These files live on the board at `/data/local/tmp/models/` and are **not tracked
 
 **Total on device:** ~1.48 GB in `/data/local/tmp/models/`
 
+## DeepX Dual demo — EasyOCR detector on HTP
+
+| File | Size | Description |
+|---|---|---|
+| `easyocr_detector_qcs8550.bin` | 40 MB | EasyOCR CRAFT text detector — QAIRT context for HTP (`/data/local/tmp/easyocr/`) |
+
+- Input `image` `(1,3,480,800)` float32 NCHW; output `output_0` `(1,240,400,2)` float32 (text/link score maps).
+- Runs via `qnn-net-run --retrieve_context=... --backend=/usr/lib/libQnnHtp.so` from `easyocr_worker.py`.
+- **Must be compiled with QAIRT `2.42`** to match the board runtime (`qnn-net-run v2.41.0`); `2.45+` fails to load (`Create From Binary failure`).
+- Detector on HTP ~0.5s/cycle (incl. context load) vs ~4.8s on CPU; recognizer stays on CPU.
+
+Recompile:
+```sh
+python board/scripts/compile_easyocr_qnn.py <export_dir> 2.42
+adb push <export_dir>/easyocr_detector_qcs8550.bin /data/local/tmp/easyocr/
+```
+
 ## How to re-deploy if wiped
 
 ```sh

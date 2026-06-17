@@ -4,13 +4,17 @@
 # e.g.:   bash board/deploy.sh a9ef4ffe
 
 set -e
+export MSYS_NO_PATHCONV=1   # prevent Git Bash from converting /data/... to Windows paths
 ADB="C:/platform-tools/platform-tools/adb.exe"
 SER=${1:-}
 [ -n "$SER" ] && ADB="$ADB -s $SER"
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd -W)"  # pwd -W gives C:/... on Git Bash
 
 echo "=== Deploying to board ($SER) ==="
+
+# Ensure adb runs as root (needed for /lib/systemd/system writes)
+$ADB root && sleep 1
 
 # ---------- scripts ----------
 for f in edge_art_genai.py edge_art.py pose_worker.py seg_worker.py face_worker.py \
@@ -19,9 +23,14 @@ for f in edge_art_genai.py edge_art.py pose_worker.py seg_worker.py face_worker.
     $ADB push "$ROOT/board/scripts/$f" "/data/local/tmp/$f"
 done
 
+# ---------- demo picker ----------
+$ADB push "$ROOT/src/demo_picker.py" "/data/local/tmp/demo_picker"
+$ADB push "$ROOT/src/demo_picker.py" "/data/local/tmp/demo_picker.py"
+
 # ---------- systemd services ----------
-for svc in demo-picker.service edge-art.service imdt-deepx-demo.service; do
-    $ADB push "$ROOT/board/systemd/$svc" "/lib/systemd/system/$svc"
+# Push to /etc/systemd/system/ — takes precedence over /lib/systemd/system/ on this board
+for svc in demo-picker.service edge-art.service imdt-deepx-demo.service yolo26-parallel.service; do
+    $ADB push "$ROOT/board/systemd/$svc" "/etc/systemd/system/$svc"
 done
 
 # ---------- permissions ----------

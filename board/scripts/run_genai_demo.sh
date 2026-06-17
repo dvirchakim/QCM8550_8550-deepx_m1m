@@ -21,5 +21,9 @@ insmod dxrt_driver.ko 2>/dev/null || true
 pkill -9 gst-launch-1.0 2>/dev/null || true
 sleep 1
 
+# restart camera server so previous demo fully releases the camera
+systemctl restart qmmf-server.service 2>/dev/null || true
+sleep 4
+
 echo "[run] Starting Edge-Art GenAI Demo ..."
 python3 /data/local/tmp/edge_art_genai.py

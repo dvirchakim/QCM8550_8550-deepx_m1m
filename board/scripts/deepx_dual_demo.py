@@ -43,11 +43,11 @@ COMBO_W, COMBO_H = CAM_W * 2, CAM_H       # 2560 x 720 (cam0|cam1)
 COMBO_BYTES      = COMBO_W * COMBO_H * 3
 
 DEEPX_WORKER = '/data/local/tmp/dual_deepx_worker.py'
-TROCR_WORKER = '/data/local/tmp/trocr_worker.py'
+OCR_WORKER   = '/data/local/tmp/easyocr_worker.py'
 ADSP_PATH    = '/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp'
 ORT_PATH     = '/data/local/tmp/ort181'
 
-TROCR_INTERVAL_S  = 6.0
+OCR_INTERVAL_S    = 3.0
 CAM_STALL_TIMEOUT = 5.0
 DEPTH_MAP_BYTES   = DEPTH_H * DEPTH_W * 4   # float32 reply
 DEPTH_IN_BYTES    = DEPTH_H * DEPTH_W * 3
@@ -122,11 +122,11 @@ def spawn_deepx_worker():
                             stderr=sys.stderr, bufsize=0)
 
 
-def spawn_trocr_worker():
+def spawn_ocr_worker():
     env = os.environ.copy()
     pp = env.get('PYTHONPATH', '')
     env['PYTHONPATH'] = f'{ORT_PATH}:{pp}' if pp else ORT_PATH
-    return subprocess.Popen(['python3', TROCR_WORKER],
+    return subprocess.Popen(['python3', OCR_WORKER],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=sys.stderr, bufsize=0, env=env)
 
@@ -248,16 +248,16 @@ def req_infer(worker, frame0, frame1):
             landmarks = lm
     return depth, depth_ms, face_ms, landmarks, score
 
-# ── TrOCR thread (persistent worker) ───────────────────────────────────────────
-_ocr_text = 'Initializing TrOCR ...'
+# ── EasyOCR thread (persistent worker) ─────────────────────────────────────────
+_ocr_text = 'Initializing EasyOCR ...'
 _ocr_lock = threading.Lock()
 
 
-def trocr_thread(trocr_ref):
+def ocr_thread(ocr_ref):
     global _ocr_text
     time.sleep(5.0)
     while True:
-        w = trocr_ref[0]
+        w = ocr_ref[0]
         with _frame_lock:
             f1 = None if _frame1 is None else _frame1.copy()
         if w is not None and w.poll() is None and f1 is not None:
@@ -272,8 +272,8 @@ def trocr_thread(trocr_ref):
                     with _ocr_lock:
                         _ocr_text = txt if txt else '[no text detected]'
             except Exception as e:
-                print(f'[trocr] error: {e}', flush=True)
-        time.sleep(TROCR_INTERVAL_S)
+                print(f'[easyocr] error: {e}', flush=True)
+        time.sleep(OCR_INTERVAL_S)
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
 FONT        = cv2.FONT_HERSHEY_SIMPLEX
@@ -339,7 +339,7 @@ def panel_face(frame1, landmarks, score, ms):
 
 def panel_trocr(text):
     p = np.full((QUAD_H, QUAD_W, 3), 18, np.uint8)
-    _title(p, 'TrOCR text recognition', 'ONNX Runtime')
+    _title(p, 'EasyOCR text recognition', 'ONNX Runtime')
     # strip non-ASCII — cv2.putText cannot render Unicode
     text_safe = ''.join(c for c in text if 32 <= ord(c) < 127)
     # word-wrap: ~40 chars fits comfortably at scale 1.0 on 960px panel
@@ -383,26 +383,26 @@ def main():
     if not wait_ready(deepx_w, 'deepx', timeout=180):
         print('[deepx-dual] DeepX worker failed to become ready', flush=True)
 
-    trocr_ref = [spawn_trocr_worker()]
-    print('[deepx-dual] loading TrOCR (this can take ~10s) ...', flush=True)
-    if not wait_ready(trocr_ref[0], 'trocr', timeout=180):
-        print('[deepx-dual] TrOCR worker failed — text panel will be empty', flush=True)
+    ocr_ref = [spawn_ocr_worker()]
+    print('[deepx-dual] loading EasyOCR ...', flush=True)
+    if not wait_ready(ocr_ref[0], 'easyocr', timeout=180):
+        print('[deepx-dual] EasyOCR worker failed — text panel will be empty', flush=True)
 
     cam_ref = [spawn_cameras()]
     time.sleep(2.0)
     threading.Thread(target=cam_thread, args=(cam_ref, spawn_cameras), daemon=True).start()
-    threading.Thread(target=trocr_thread, args=(trocr_ref,), daemon=True).start()
+    threading.Thread(target=ocr_thread, args=(ocr_ref,), daemon=True).start()
 
     disp = spawn_display()
     time.sleep(0.5)
 
     def cleanup(*_):
         print('[deepx-dual] shutting down ...', flush=True)
-        for p in [deepx_w, trocr_ref[0], cam_ref[0], disp]:
+        for p in [deepx_w, ocr_ref[0], cam_ref[0], disp]:
             try: p.terminate()
             except Exception: pass
         time.sleep(2.0)
-        for p in [deepx_w, trocr_ref[0], cam_ref[0], disp]:
+        for p in [deepx_w, ocr_ref[0], cam_ref[0], disp]:
             try:
                 if p.poll() is None: p.kill()
             except Exception: pass
